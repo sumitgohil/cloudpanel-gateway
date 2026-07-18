@@ -1,6 +1,7 @@
 [Unit]
 Description=CloudPanel Gateway privileged CLI helper
-After=network.target
+After=network.target cloudpanel-gateway-nginx-commit.service
+Requires=cloudpanel-gateway-nginx-commit.service
 
 [Service]
 Type=simple

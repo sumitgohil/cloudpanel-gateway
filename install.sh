@@ -2,8 +2,9 @@
 set -euo pipefail
 
 RELEASE_VERSION=""
-RELEASE_BASE="https://github.com/psng-tech/cloudpanel-gateway/releases/download"
-PUBLIC_KEY="${CPG_MINISIGN_PUBLIC_KEY:-}"
+RELEASE_BASE="https://github.com/sumitgohil/cloudpanel-gateway/releases/download"
+DEFAULT_PUBLIC_KEY="RWSc0fp65r6GcJiRAcydy1W60Jk8kvusaJyijgESv0WLwPaEd15sohP/"
+PUBLIC_KEY="${CPG_MINISIGN_PUBLIC_KEY:-$DEFAULT_PUBLIC_KEY}"
 LOCAL_BINARY=""
 
 usage() {
@@ -14,12 +15,13 @@ Installs CloudPanel Gateway on Ubuntu with CloudPanel already installed.
 
   --version VERSION       Signed release version (required unless --local-binary)
   --release-base URL      Release download base URL
-  --public-key KEY        minisign public key (or CPG_MINISIGN_PUBLIC_KEY)
+  --public-key KEY        override the embedded Minisign public key
   --local-binary PATH     Development-only prebuilt Linux binary
   --help                  Show this help
 
-Production installs require a signed GitHub Release. --local-binary is for a
-controlled test VM only and never bypasses binary permission or OS checks.
+Production installs verify both signed SHA256SUMS and Minisign release assets.
+--local-binary is for a controlled test VM only and never bypasses binary
+permission or OS checks.
 EOF
 }
 while [[ $# -gt 0 ]]; do
@@ -46,11 +48,21 @@ if [[ -n "$LOCAL_BINARY" ]]; then
   [[ -f "$LOCAL_BINARY" && -x "$LOCAL_BINARY" ]] || { echo "Invalid local binary." >&2; exit 1; }
   cp "$LOCAL_BINARY" "$binary"
 else
-  [[ -n "$RELEASE_VERSION" && -n "$PUBLIC_KEY" ]] || { echo "--version and --public-key are required for signed release installs." >&2; exit 2; }
-  command -v minisign >/dev/null || { echo "minisign must be installed to verify releases." >&2; exit 1; }
-  base="${RELEASE_BASE}/v${RELEASE_VERSION}/cloudpanel-gateway_${RELEASE_VERSION}_linux_${ARCH}"
-  curl --fail --location --proto '=https' --tlsv1.2 -o "$binary" "$base"
-  curl --fail --location --proto '=https' --tlsv1.2 -o "$binary.minisig" "$base.minisig"
+  [[ -n "$RELEASE_VERSION" && -n "$PUBLIC_KEY" ]] || { echo "--version is required for signed release installs." >&2; exit 2; }
+  [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || { echo "--version must be semantic without a v prefix." >&2; exit 2; }
+  command -v curl >/dev/null || { apt-get update; apt-get install --yes --no-install-recommends curl; }
+  command -v minisign >/dev/null || { apt-get update; apt-get install --yes --no-install-recommends minisign; }
+  command -v sha256sum >/dev/null || { echo "sha256sum is required to verify releases." >&2; exit 1; }
+  asset="cloudpanel-gateway_${RELEASE_VERSION}_linux_${ARCH}"
+  base="${RELEASE_BASE}/v${RELEASE_VERSION}"
+  binary="$tmp_dir/$asset"
+  curl --fail --location --proto '=https' --tlsv1.2 -o "$binary" "$base/$asset"
+  curl --fail --location --proto '=https' --tlsv1.2 -o "$binary.minisig" "$base/$asset.minisig"
+  curl --fail --location --proto '=https' --tlsv1.2 -o "$tmp_dir/SHA256SUMS" "$base/SHA256SUMS"
+  curl --fail --location --proto '=https' --tlsv1.2 -o "$tmp_dir/SHA256SUMS.minisig" "$base/SHA256SUMS.minisig"
+  minisign -Vm "$tmp_dir/SHA256SUMS" -P "$PUBLIC_KEY"
+  expected_sha="$(awk -v name="$asset" '$2 == name { print $1; found=1 } END { if (!found) exit 1 }' "$tmp_dir/SHA256SUMS")" || { echo "release checksum entry is missing." >&2; exit 1; }
+  printf '%s  %s\n' "$expected_sha" "$binary" | sha256sum --check --status - || { echo "release checksum verification failed." >&2; exit 1; }
   minisign -Vm "$binary" -P "$PUBLIC_KEY"
 fi
 
@@ -71,6 +83,7 @@ EOF
   chmod 0644 /etc/cloudpanel-gateway/config.json
 fi
 install -m 0644 "$(dirname "$0")/deploy/systemd/cloudpanel-gateway-helper.service" /etc/systemd/system/cloudpanel-gateway-helper.service
+install -m 0644 "$(dirname "$0")/deploy/systemd/cloudpanel-gateway-nginx-commit.service" /etc/systemd/system/cloudpanel-gateway-nginx-commit.service
 install -m 0644 "$(dirname "$0")/deploy/systemd/cloudpanel-gateway.service" /etc/systemd/system/cloudpanel-gateway.service
 if [[ ! -f /var/lib/cloudpanel-gateway/state.db ]]; then
   /usr/local/bin/cloudpanel-gateway --config /etc/cloudpanel-gateway/config.json bootstrap
@@ -79,6 +92,6 @@ chown cloudpanel-gateway:cloudpanel-gateway /var/lib/cloudpanel-gateway/state.db
 chown root:cloudpanel-gateway /var/lib/cloudpanel-gateway/token-pepper
 chmod 0640 /var/lib/cloudpanel-gateway/token-pepper
 systemctl daemon-reload
-systemctl enable --now cloudpanel-gateway-helper.service cloudpanel-gateway.service
+systemctl enable --now cloudpanel-gateway-nginx-commit.service cloudpanel-gateway-helper.service cloudpanel-gateway.service
 curl --fail --silent --show-error http://127.0.0.1:9780/readyz >/dev/null
 echo "Installed CloudPanel Gateway. Read the one-time bootstrap token in /root/cloudpanel-gateway-bootstrap-token.txt."
