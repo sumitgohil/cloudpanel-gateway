@@ -53,7 +53,18 @@ func NewRootCommand() *cobra.Command {
 		defer s.Close()
 		return ListenHelper(cmd.Context(), c, s)
 	}})
-	root.AddCommand(bootstrapCmd(load), tokenCmd(load), policyCmd(load), domainCmd(load), doctorCmd(load), serviceCmd(load), completionCmd(root))
+	root.AddCommand(&cobra.Command{Use: "nginx-commit", Short: "Run the isolated root-only Nginx validation and commit service", RunE: func(cmd *cobra.Command, args []string) error {
+		if e := requireRoot(); e != nil {
+			return e
+		}
+		c, s, e := load(false)
+		if e != nil {
+			return e
+		}
+		defer s.Close()
+		return ListenNginxCommit(cmd.Context(), c)
+	}})
+	root.AddCommand(bootstrapCmd(load), tokenCmd(load), policyCmd(load), domainCmd(load), settingsCmd(load), doctorCmd(load), serviceCmd(load), completionCmd(root))
 	root.AddCommand(&cobra.Command{Use: "version", Short: "Print version", Run: func(cmd *cobra.Command, args []string) { fmt.Fprintln(cmd.OutOrStdout(), Version) }})
 	return root
 }
@@ -399,6 +410,119 @@ func domainCmd(load stateLoader) *cobra.Command {
 	tls.AddCommand(issue)
 	cmd.AddCommand(mapCmd, adopt, status, unmap, tls)
 	return cmd
+}
+
+func settingsCmd(load stateLoader) *cobra.Command {
+	call := func(cmd *cobra.Command, request SettingsRequest) error {
+		if err := requireRoot(); err != nil {
+			return err
+		}
+		c, s, err := load(false)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		var out any
+		if err = CallSettingsHelper(cmd.Context(), c, request, &out); err != nil {
+			return err
+		}
+		return json.NewEncoder(cmd.OutOrStdout()).Encode(out)
+	}
+	site := &cobra.Command{Use: "site", Short: "Inspect and safely update CloudPanel site settings"}
+	var domain string
+	get := &cobra.Command{Use: "settings", Short: "Get site settings", RunE: func(cmd *cobra.Command, args []string) error {
+		return call(cmd, SettingsRequest{Operation: settingsGet, Domain: domain})
+	}}
+	get.Flags().StringVar(&domain, "domain", "", "site domain")
+	_ = get.MarkFlagRequired("domain")
+	var root, revision string
+	var confirm bool
+	rootCmd := &cobra.Command{Use: "root", Short: "Update a site's htdocs-relative root directory", RunE: func(cmd *cobra.Command, args []string) error {
+		return call(cmd, SettingsRequest{Operation: settingsUpdateRoot, Domain: domain, RootDirectory: root, IfMatchRevision: revision, Confirm: confirm})
+	}}
+	rootCmd.Flags().StringVar(&domain, "domain", "", "site domain")
+	rootCmd.Flags().StringVar(&root, "root-directory", "", "existing directory relative to htdocs")
+	rootCmd.Flags().StringVar(&revision, "if-match-revision", "", "revision from site settings")
+	rootCmd.Flags().BoolVar(&confirm, "confirm", false, "confirm this root-directory change")
+	_ = rootCmd.MarkFlagRequired("domain")
+	_ = rootCmd.MarkFlagRequired("root-directory")
+	_ = rootCmd.MarkFlagRequired("if-match-revision")
+	var passDomain, passRevision string
+	var passConfirm bool
+	password := &cobra.Command{Use: "user rotate-password", Short: "Generate and rotate the site user's SSH/SFTP password", RunE: func(cmd *cobra.Command, args []string) error {
+		return call(cmd, SettingsRequest{Operation: settingsRotatePass, Domain: passDomain, IfMatchRevision: passRevision, Confirm: passConfirm})
+	}}
+	password.Flags().StringVar(&passDomain, "domain", "", "site domain")
+	password.Flags().StringVar(&passRevision, "if-match-revision", "", "revision from site settings")
+	password.Flags().BoolVar(&passConfirm, "confirm", false, "confirm password rotation")
+	_ = password.MarkFlagRequired("domain")
+	_ = password.MarkFlagRequired("if-match-revision")
+	site.AddCommand(get, rootCmd, password)
+	php := &cobra.Command{Use: "php", Short: "Inspect and update reviewed PHP settings"}
+	var phpDomain, phpRevision string
+	var values []string
+	phpGet := &cobra.Command{Use: "get", Short: "Get PHP settings", RunE: func(cmd *cobra.Command, args []string) error {
+		return call(cmd, SettingsRequest{Operation: settingsGetPHP, Domain: phpDomain})
+	}}
+	phpGet.Flags().StringVar(&phpDomain, "domain", "", "site domain")
+	_ = phpGet.MarkFlagRequired("domain")
+	phpUpdate := &cobra.Command{Use: "update", Short: "Update safe PHP settings", RunE: func(cmd *cobra.Command, args []string) error {
+		v, err := parseSetValues(values)
+		if err != nil {
+			return err
+		}
+		return call(cmd, SettingsRequest{Operation: settingsUpdatePHP, Domain: phpDomain, IfMatchRevision: phpRevision, PHPValues: v})
+	}}
+	phpUpdate.Flags().StringVar(&phpDomain, "domain", "", "site domain")
+	phpUpdate.Flags().StringVar(&phpRevision, "if-match-revision", "", "revision from php get")
+	phpUpdate.Flags().StringSliceVar(&values, "set", nil, "key=value (repeatable)")
+	_ = phpUpdate.MarkFlagRequired("domain")
+	_ = phpUpdate.MarkFlagRequired("if-match-revision")
+	php.AddCommand(phpGet, phpUpdate)
+	pagespeed := &cobra.Command{Use: "pagespeed", Short: "Inspect, configure, and purge PageSpeed"}
+	var psDomain, psRevision, psPreset string
+	var psEnabled bool
+	var enable, disable []string
+	psGet := &cobra.Command{Use: "get", Short: "Get PageSpeed settings", RunE: func(cmd *cobra.Command, args []string) error {
+		return call(cmd, SettingsRequest{Operation: settingsGetPageSpeed, Domain: psDomain})
+	}}
+	psGet.Flags().StringVar(&psDomain, "domain", "", "site domain")
+	_ = psGet.MarkFlagRequired("domain")
+	psUpdate := &cobra.Command{Use: "update", Short: "Update PageSpeed preset and filters", RunE: func(cmd *cobra.Command, args []string) error {
+		return call(cmd, SettingsRequest{Operation: settingsUpdatePS, Domain: psDomain, IfMatchRevision: psRevision, PageSpeed: &PageSpeedUpdate{Enabled: psEnabled, Preset: psPreset, EnableFilters: enable, DisableFilters: disable}})
+	}}
+	psUpdate.Flags().StringVar(&psDomain, "domain", "", "site domain")
+	psUpdate.Flags().StringVar(&psRevision, "if-match-revision", "", "revision from pagespeed get")
+	psUpdate.Flags().BoolVar(&psEnabled, "enabled", false, "enable PageSpeed")
+	psUpdate.Flags().StringVar(&psPreset, "preset", "core", "core, image, or cloudpanel-default")
+	psUpdate.Flags().StringSliceVar(&enable, "enable-filter", nil, "allowlisted filter to enable")
+	psUpdate.Flags().StringSliceVar(&disable, "disable-filter", nil, "allowlisted filter to disable")
+	_ = psUpdate.MarkFlagRequired("domain")
+	_ = psUpdate.MarkFlagRequired("if-match-revision")
+	psPurge := &cobra.Command{Use: "purge", Short: "Purge only this site's PageSpeed cache", RunE: func(cmd *cobra.Command, args []string) error {
+		return call(cmd, SettingsRequest{Operation: settingsPurgePS, Domain: psDomain})
+	}}
+	psPurge.Flags().StringVar(&psDomain, "domain", "", "site domain")
+	_ = psPurge.MarkFlagRequired("domain")
+	pagespeed.AddCommand(psGet, psUpdate, psPurge)
+	cmd := &cobra.Command{Use: "settings", Short: "CloudPanel site, PHP, and PageSpeed controls", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error { return cmd.Help() }}
+	cmd.AddCommand(site, php, pagespeed)
+	return cmd
+}
+
+func parseSetValues(items []string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, item := range items {
+		parts := strings.SplitN(item, "=", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf("invalid --set %q; use key=value", item)
+		}
+		out[parts[0]] = parts[1]
+	}
+	if len(out) == 0 {
+		return nil, errors.New("at least one --set key=value is required")
+	}
+	return out, nil
 }
 func doctorCmd(load stateLoader) *cobra.Command {
 	return &cobra.Command{Use: "doctor", Short: "Check CloudPanel Gateway prerequisites", RunE: func(cmd *cobra.Command, args []string) error {
