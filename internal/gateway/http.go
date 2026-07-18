@@ -3,7 +3,9 @@ package gateway
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -82,6 +84,23 @@ type mcpPageSpeedInput struct {
 	EnableFilters   []string `json:"enable_filters,omitempty"`
 	DisableFilters  []string `json:"disable_filters,omitempty"`
 }
+type mcpDeployInput struct {
+	Domain     string `json:"domain"`
+	ArtifactID string `json:"artifact_id"`
+	TargetDir  string `json:"target_dir"`
+	Replace    bool   `json:"replace"`
+	Confirm    bool   `json:"confirm"`
+}
+type mcpBackupCreateInput struct {
+	Domain     string `json:"domain"`
+	Components string `json:"components"`
+}
+type mcpBackupRestoreInput struct {
+	Domain     string `json:"domain"`
+	BackupID   string `json:"backup_id"`
+	Components string `json:"components"`
+	Confirm    bool   `json:"confirm"`
+}
 type tokenContextKey struct{}
 
 func NewAPIServer(c Config, s *State, logger *slog.Logger) *APIServer {
@@ -111,7 +130,9 @@ func (a *APIServer) Handler() http.Handler {
 }
 func (a *APIServer) limit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+		// Artifact uploads are individually constrained to 100 MiB. Other API
+		// requests remain bounded well below this by their JSON decoding rules.
+		r.Body = http.MaxBytesReader(w, r.Body, 101<<20)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
 		next.ServeHTTP(w, r)
@@ -296,7 +317,7 @@ func (a *APIServer) artifacts(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, 500, "artifact storage unavailable", requestID(r))
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 20<<20)
+	r.Body = http.MaxBytesReader(w, r.Body, maxZIPCompressed)
 	id, e := newID("artifact_", 18)
 	if e != nil {
 		jsonError(w, 500, "randomness unavailable", requestID(r))
@@ -308,18 +329,50 @@ func (a *APIServer) artifacts(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, 500, "artifact create failed", requestID(r))
 		return
 	}
-	n, e := io.Copy(f, r.Body)
+	h := sha256.New()
+	n, e := io.Copy(io.MultiWriter(f, h), r.Body)
 	closeErr := f.Close()
 	if e != nil || closeErr != nil {
 		_ = os.Remove(path)
 		jsonError(w, 400, "artifact upload failed", requestID(r))
 		return
 	}
-	jsonResponse(w, 201, map[string]any{"id": id, "size": n, "expires_in_seconds": 3600})
+	if n < 4 {
+		_ = os.Remove(path)
+		jsonError(w, 400, "artifact must be a ZIP archive", requestID(r))
+		return
+	}
+	probe, probeErr := os.Open(path)
+	if probeErr != nil {
+		jsonError(w, 500, "artifact validation failed", requestID(r))
+		return
+	}
+	magic := make([]byte, 4)
+	_, probeErr = io.ReadFull(probe, magic)
+	_ = probe.Close()
+	if probeErr != nil || string(magic[:2]) != "PK" {
+		_ = os.Remove(path)
+		jsonError(w, 400, "artifact must be a ZIP archive", requestID(r))
+		return
+	}
+	t, _ := r.Context().Value(tokenContextKey{}).(*Token)
+	now := time.Now().UTC()
+	artifact := Artifact{ID: id, Path: path, SHA256: hex.EncodeToString(h.Sum(nil)), Size: n, OwnerTokenID: t.ID, CreatedAt: now, ExpiresAt: now.Add(artifactTTL)}
+	if e = a.State.PutArtifact(artifact); e != nil {
+		_ = os.Remove(path)
+		jsonError(w, 500, "artifact metadata create failed", requestID(r))
+		return
+	}
+	_ = a.State.CleanupArtifacts(now)
+	jsonResponse(w, 201, map[string]any{"id": id, "sha256": artifact.SHA256, "size": n, "expires_at": artifact.ExpiresAt})
 }
 
 func (a *APIServer) siteLogs(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/sites/"), "/")
+	if len(parts) >= 2 && (parts[1] == "tls" || parts[1] == "deployments" || parts[1] == "backups") {
+		a.siteOperations(w, r, parts)
+		return
+	}
 	if len(parts) >= 2 && parts[1] != "logs" {
 		a.siteSettings(w, r, parts)
 		return
@@ -381,6 +434,118 @@ func (a *APIServer) siteLogs(w http.ResponseWriter, r *http.Request) {
 	default:
 		jsonError(w, http.StatusNotFound, "log endpoint not found", requestID(r))
 	}
+}
+
+func (a *APIServer) siteOperations(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) < 2 || ValidateDomain(parts[0]) != nil {
+		jsonError(w, 404, "site operation not found", requestID(r))
+		return
+	}
+	domain, operation := parts[0], parts[1]
+	t, _ := r.Context().Value(tokenContextKey{}).(*Token)
+	need := ""
+	switch operation {
+	case "tls":
+		need = "tls:read"
+	case "deployments":
+		need = "files:write"
+	case "backups":
+		if r.Method == http.MethodGet {
+			need = "backups:read"
+		} else {
+			need = "backups:write"
+		}
+	}
+	if t == nil || !HasScope(t, need) {
+		a.denied.Add(1)
+		jsonError(w, 403, "insufficient scope", requestID(r))
+		return
+	}
+	start := time.Now()
+	var out any
+	var err error
+	var action string
+	switch operation {
+	case "tls":
+		if r.Method != http.MethodGet || len(parts) != 2 {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		action = "tls.get_status"
+		value := TLSDetails{}
+		err = CallTypedHelper(r.Context(), a.Config, HelperRequest{TLS: &TLSRequest{Domain: domain}}, &value)
+		out = value
+	case "deployments":
+		if r.Method != http.MethodPost || len(parts) != 2 {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var in DeployRequest
+		d := json.NewDecoder(r.Body)
+		d.DisallowUnknownFields()
+		if d.Decode(&in) != nil {
+			jsonError(w, 400, "invalid JSON deployment request", requestID(r))
+			return
+		}
+		in.Domain = domain
+		in.OwnerTokenID = t.ID
+		action = "file.deploy_artifact"
+		value := DeploymentResult{}
+		err = CallTypedHelper(r.Context(), a.Config, HelperRequest{Deploy: &in}, &value)
+		out = value
+	case "backups":
+		if len(parts) == 2 && r.Method == http.MethodGet {
+			action = "backup.list"
+			value := map[string]any{}
+			err = CallTypedHelper(r.Context(), a.Config, HelperRequest{Backup: &BackupRequest{Operation: "list", Domain: domain}}, &value)
+			out = value
+		} else if len(parts) == 2 && r.Method == http.MethodPost {
+			var in struct {
+				Components string `json:"components"`
+			}
+			d := json.NewDecoder(r.Body)
+			d.DisallowUnknownFields()
+			if d.Decode(&in) != nil {
+				jsonError(w, 400, "invalid JSON backup request", requestID(r))
+				return
+			}
+			action = "backup.create"
+			value := BackupResult{}
+			err = CallTypedHelper(r.Context(), a.Config, HelperRequest{Backup: &BackupRequest{Operation: "create", Domain: domain, Components: in.Components}}, &value)
+			out = value
+		} else if len(parts) == 4 && parts[2] != "" && parts[3] == "restore" && r.Method == http.MethodPost {
+			var in struct {
+				Components string `json:"components"`
+				Confirm    bool   `json:"confirm"`
+			}
+			d := json.NewDecoder(r.Body)
+			d.DisallowUnknownFields()
+			if d.Decode(&in) != nil {
+				jsonError(w, 400, "invalid JSON restore request", requestID(r))
+				return
+			}
+			action = "backup.restore"
+			value := BackupResult{}
+			err = CallTypedHelper(r.Context(), a.Config, HelperRequest{Backup: &BackupRequest{Operation: "restore", Domain: domain, BackupID: parts[2], Components: in.Components, Confirm: in.Confirm}}, &value)
+			out = value
+		} else {
+			jsonError(w, 404, "backup endpoint not found", requestID(r))
+			return
+		}
+	default:
+		jsonError(w, 404, "site operation not found", requestID(r))
+		return
+	}
+	outcome, detail := "ok", "site operation completed"
+	if err != nil {
+		outcome, detail = "error", "site operation failed"
+	}
+	a.State.Audit(requestID(r), t.ID, action, outcome, detail, time.Since(start))
+	if err != nil {
+		jsonError(w, 400, err.Error(), requestID(r))
+		return
+	}
+	jsonResponse(w, 200, out)
 }
 
 func (a *APIServer) siteSettings(w http.ResponseWriter, r *http.Request, parts []string) {
@@ -533,7 +698,11 @@ func (a *APIServer) openapi(w http.ResponseWriter, r *http.Request) {
 		"/v1/sites/{domain}/php":                                map[string]any{"get": map[string]any{"summary": "Read safe PHP settings", "responses": response(map[string]any{"$ref": "#/components/schemas/PHPSettings"})}, "patch": map[string]any{"summary": "Update reviewed PHP settings", "responses": response(map[string]any{"$ref": "#/components/schemas/PHPSettings"})}},
 		"/v1/sites/{domain}/pagespeed":                          map[string]any{"get": map[string]any{"summary": "Read PageSpeed settings", "responses": response(map[string]any{"$ref": "#/components/schemas/PageSpeed"})}, "patch": map[string]any{"summary": "Update PageSpeed preset and filters", "responses": response(map[string]any{"$ref": "#/components/schemas/PageSpeed"})}},
 		"/v1/sites/{domain}/pagespeed/purge":                    map[string]any{"post": map[string]any{"summary": "Purge the validated per-site PageSpeed cache", "responses": response(map[string]any{"type": "object"})}},
-		"/mcp":                                                  map[string]any{"post": map[string]string{"summary": "MCP Streamable HTTP endpoint"}},
+		"/v1/sites/{domain}/tls":                                map[string]any{"get": map[string]any{"summary": "Read certificate details and expiry-based renewal health (tls:read)", "responses": response(map[string]any{"$ref": "#/components/schemas/TLSDetails"})}},
+		"/v1/sites/{domain}/deployments":                        map[string]any{"post": map[string]any{"summary": "Deploy a managed ZIP artifact (files:write plus file.deploy_artifact policy)", "responses": response(map[string]any{"$ref": "#/components/schemas/Deployment"})}},
+		"/v1/sites/{domain}/backups":                            map[string]any{"get": map[string]any{"summary": "List managed encrypted backups (backups:read)", "responses": response(map[string]any{"type": "object"})}, "post": map[string]any{"summary": "Create a managed encrypted backup (backups:write)", "responses": response(map[string]any{"$ref": "#/components/schemas/BackupResult"})}},
+		"/v1/sites/{domain}/backups/{backup_id}/restore":        map[string]any{"post": map[string]any{"summary": "Restore selected components with confirm=true (backups:write plus backup.restore policy)", "responses": response(map[string]any{"$ref": "#/components/schemas/BackupResult"})}},
+		"/mcp": map[string]any{"post": map[string]string{"summary": "MCP Streamable HTTP endpoint"}},
 	}, "components": map[string]any{"schemas": map[string]any{
 		"LogSource":        map[string]any{"type": "object", "properties": map[string]any{"id": map[string]string{"type": "string"}, "kind": map[string]string{"type": "string"}, "path": map[string]string{"type": "string", "description": "Safe relative path only"}, "rotated": map[string]string{"type": "boolean"}, "size": map[string]string{"type": "integer"}, "modified": map[string]string{"type": "string", "format": "date-time"}}},
 		"LogLine":          map[string]any{"type": "object", "properties": map[string]any{"source": map[string]string{"type": "string"}, "timestamp": map[string]string{"type": "string", "format": "date-time"}, "timestamp_unknown": map[string]string{"type": "boolean"}, "line": map[string]string{"type": "string"}}},
@@ -542,6 +711,9 @@ func (a *APIServer) openapi(w http.ResponseWriter, r *http.Request) {
 		"PHPSettings":      map[string]any{"type": "object", "properties": map[string]any{"applicable": map[string]string{"type": "boolean"}, "php_version": map[string]string{"type": "string"}, "values": map[string]any{"type": "object", "additionalProperties": map[string]string{"type": "string"}}, "revision": map[string]string{"type": "string"}}},
 		"PageSpeed":        map[string]any{"type": "object", "properties": map[string]any{"available": map[string]string{"type": "boolean"}, "enabled": map[string]string{"type": "boolean"}, "preset": map[string]string{"type": "string"}, "revision": map[string]string{"type": "string"}}},
 		"PasswordRotation": map[string]any{"type": "object", "properties": map[string]any{"site_user": map[string]string{"type": "string"}, "password": map[string]string{"type": "string", "writeOnly": "true"}}},
+		"TLSDetails":       map[string]any{"type": "object", "properties": map[string]any{"issuer": map[string]string{"type": "string"}, "subject": map[string]string{"type": "string"}, "expires_at": map[string]string{"type": "string", "format": "date-time"}, "sans": map[string]any{"type": "array", "items": map[string]string{"type": "string"}}, "renewal_health": map[string]string{"type": "string"}}},
+		"Deployment":       map[string]any{"type": "object", "properties": map[string]any{"artifact_id": map[string]string{"type": "string"}, "sha256": map[string]string{"type": "string"}, "target_dir": map[string]string{"type": "string"}, "files": map[string]string{"type": "integer"}}},
+		"BackupResult":     map[string]any{"type": "object", "properties": map[string]any{"backup": map[string]any{"type": "object"}, "retention": map[string]any{"type": "object"}, "safety_backup_id": map[string]string{"type": "string"}}},
 	}}})
 }
 func (a *APIServer) docs(w http.ResponseWriter, r *http.Request) {
@@ -670,7 +842,80 @@ func (a *APIServer) newMCP(t *Token) *mcp.Server {
 		res, err := settingsCall(ctx, settingsPurgePS, "cache:purge", SettingsRequest{Domain: in.Domain}, &out)
 		return res, out, err
 	})
+	mcp.AddTool(s, &mcp.Tool{Name: "tls_get_status", Description: "Read the active TLS certificate issuer, subject, serial, expiry, SANs, CloudPanel/vhost consistency, and expiry-based renewal health. It never exposes private key material. Requires tls:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpSiteInput) (*mcp.CallToolResult, TLSDetails, error) {
+		if !HasScope(t, "tls:read") {
+			return mcpScopeError(), TLSDetails{}, nil
+		}
+		out := TLSDetails{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{TLS: &TLSRequest{Domain: in.Domain}}, &out)
+		a.auditMCP(t, "tls.get_status", start, err)
+		if err != nil {
+			return mcpToolError(err), TLSDetails{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "TLS status retrieved"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "file_deploy_artifact", Description: "Deploy a previously uploaded managed ZIP artifact into an existing site-root-relative directory. Requires files:write and locally enabled file.deploy_artifact policy. Existing non-empty targets additionally require replace=true and confirm=true."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpDeployInput) (*mcp.CallToolResult, DeploymentResult, error) {
+		if !HasScope(t, "files:write") {
+			return mcpScopeError(), DeploymentResult{}, nil
+		}
+		out := DeploymentResult{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Deploy: &DeployRequest{Domain: in.Domain, ArtifactID: in.ArtifactID, TargetDir: in.TargetDir, Replace: in.Replace, Confirm: in.Confirm, OwnerTokenID: t.ID}}, &out)
+		a.auditMCP(t, "file.deploy_artifact", start, err)
+		if err != nil {
+			return mcpToolError(err), DeploymentResult{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "artifact deployed"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "site_backup_create", Description: "Create an encrypted, local managed backup of files, databases, or both. Database selection is derived from the CloudPanel site relation. Requires backups:write."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpBackupCreateInput) (*mcp.CallToolResult, BackupResult, error) {
+		if !HasScope(t, "backups:write") {
+			return mcpScopeError(), BackupResult{}, nil
+		}
+		out := BackupResult{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Backup: &BackupRequest{Operation: "create", Domain: in.Domain, Components: in.Components}}, &out)
+		a.auditMCP(t, "backup.create", start, err)
+		if err != nil {
+			return mcpToolError(err), BackupResult{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "encrypted backup created"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "site_backup_list", Description: "List encrypted local managed recovery backups for a site, including expiry and retention policy. Requires backups:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpSiteInput) (*mcp.CallToolResult, map[string]any, error) {
+		if !HasScope(t, "backups:read") {
+			return mcpScopeError(), map[string]any{}, nil
+		}
+		out := map[string]any{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Backup: &BackupRequest{Operation: "list", Domain: in.Domain}}, &out)
+		a.auditMCP(t, "backup.list", start, err)
+		if err != nil {
+			return mcpToolError(err), map[string]any{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "backups listed"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "site_backup_restore", Description: "Restore selected files, databases, or both from a managed encrypted backup. A mandatory matching pre-restore safety backup is created first. Requires backups:write, locally enabled backup.restore policy, and confirm=true."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpBackupRestoreInput) (*mcp.CallToolResult, BackupResult, error) {
+		if !HasScope(t, "backups:write") {
+			return mcpScopeError(), BackupResult{}, nil
+		}
+		out := BackupResult{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Backup: &BackupRequest{Operation: "restore", Domain: in.Domain, BackupID: in.BackupID, Components: in.Components, Confirm: in.Confirm}}, &out)
+		a.auditMCP(t, "backup.restore", start, err)
+		if err != nil {
+			return mcpToolError(err), BackupResult{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "backup restored"}}}, out, nil
+	})
 	return s
+}
+
+func (a *APIServer) auditMCP(t *Token, action string, start time.Time, err error) {
+	outcome, detail := "ok", "operation completed"
+	if err != nil {
+		outcome, detail = "error", "operation failed"
+	}
+	a.State.Audit("mcp", t.ID, action, outcome, detail, time.Since(start))
 }
 
 func mcpScopeError() *mcp.CallToolResult {

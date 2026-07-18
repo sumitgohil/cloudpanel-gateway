@@ -68,11 +68,15 @@ fi
 
 install -d -m 0755 /etc/cloudpanel-gateway
 install -d -m 0750 /var/lib/cloudpanel-gateway/artifacts /run/cloudpanel-gateway
+# Backups and their encryption key are intentionally root-only: the public
+# gateway can only request typed helper operations and never read archives.
+install -d -m 0700 /var/lib/cloudpanel-gateway/backups
 if ! id -u cloudpanel-gateway >/dev/null 2>&1; then
   useradd --system --home-dir /var/lib/cloudpanel-gateway --shell /usr/sbin/nologin cloudpanel-gateway
 fi
 gateway_gid="$(id -g cloudpanel-gateway)"
 chown cloudpanel-gateway:cloudpanel-gateway /var/lib/cloudpanel-gateway /var/lib/cloudpanel-gateway/artifacts
+chown root:root /var/lib/cloudpanel-gateway/backups
 install -m 0755 "$binary" /usr/local/bin/cloudpanel-gateway
 if [[ ! -f /etc/cloudpanel-gateway/config.json ]]; then
   cat > /etc/cloudpanel-gateway/config.json <<EOF

@@ -23,6 +23,8 @@ or `clpctl` execution to the network.
 - Read-only site log investigation and deterministic diagnostics for Nginx,
   PHP, rotated logs, and common framework application logs.
 - Revision-guarded site-root, PHP, PageSpeed, and site-user password controls.
+- Read-only TLS inspection plus policy-gated ZIP artifact deployments and
+  encrypted local site backups with a mandatory pre-restore safety backup.
 
 ## Quick start
 
@@ -60,7 +62,7 @@ root access, and an FQDN that resolves to the server.
    ```bash
    sudo cloudpanel-gateway token create \
      --label developer-agent \
-     --scopes 'sites:read,sites:write,logs:read,php:read,php:write,pagespeed:read,pagespeed:write,cache:purge,certificates:write'
+     --scopes 'sites:read,sites:write,logs:read,php:read,php:write,pagespeed:read,pagespeed:write,cache:purge,certificates:write,tls:read,artifacts:write,files:write,backups:read,backups:write'
    ```
 
 See [installation](docs/installation.md), [usage](docs/usage.md), and
@@ -96,6 +98,7 @@ enabled. Read [the security model](docs/security.md) before production use.
 | CloudPanel | Basic auth and release channel controls; Cloudflare IP updates; Varnish purge; vhost-template management. |
 | Site settings | Site facts/TLS/drift, guarded root directory update, one-time site-user password rotation, safe PHP limits/directives, and PageSpeed controls. |
 | Logs | Source discovery, bounded queries, redaction, gzip rotation support, and deterministic diagnosis signals. |
+| Recovery | TLS health inspection, managed ZIP deployment, and encrypted files/databases backups retained locally for seven days (10 GiB total). |
 
 The exact request schema is published by the running gateway at `/openapi.json`.
 The MCP server describes its typed tools during tool discovery.
@@ -121,6 +124,7 @@ Important command groups:
 - `settings site settings|root|user rotate-password`
 - `settings php get|update`
 - `settings pagespeed get|update|purge`
+- `tls status`, `file deploy-artifact`, and `backup create|list|restore`
 - `doctor`, `service`, `version`, and `completion`
 
 ## REST and MCP

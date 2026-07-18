@@ -23,6 +23,10 @@ TLS-enabled CloudPanel reverse proxy first.
 | `GET` / `PATCH /v1/sites/{domain}/php` | `php:read` / `php:write` |
 | `GET` / `PATCH /v1/sites/{domain}/pagespeed` | `pagespeed:read` / `pagespeed:write` |
 | `POST /v1/sites/{domain}/pagespeed/purge` | `cache:purge` |
+| `GET /v1/sites/{domain}/tls` | `tls:read` |
+| `POST /v1/sites/{domain}/deployments` | `files:write` + `file.deploy_artifact` policy |
+| `GET` / `POST /v1/sites/{domain}/backups` | `backups:read` / `backups:write` |
+| `POST /v1/sites/{domain}/backups/{backup_id}/restore` | `backups:write` + `backup.restore` policy + `confirm:true` |
 
 Example:
 
@@ -73,6 +77,9 @@ provides these named tools:
 - `php_get_settings`, `php_update_settings`
 - `pagespeed_get_settings`, `pagespeed_update_settings`,
   `pagespeed_purge_cache`
+- `tls_get_status`
+- `file_deploy_artifact`
+- `site_backup_create`, `site_backup_list`, `site_backup_restore`
 
 Tools return structured JSON. A log diagnosis offers deterministic evidence
 such as HTTP error rates, upstream failures, PHP fatal/timeout/memory errors,
@@ -85,3 +92,22 @@ Database transfer, manual certificate, and vhost-template file inputs must be
 created through `POST /v1/artifacts`. The gateway stores them in a restricted
 directory and expires them after one hour. User-supplied absolute file paths,
 shell snippets, and arbitrary Nginx/PHP/PageSpeed directives are rejected.
+
+ZIP deployments use the same managed artifact flow, but accept only validated
+ZIP archives up to 100 MiB compressed. Archive traversal, duplicate entries,
+symlinks, devices, and excessive expansion are rejected. The target directory
+must be relative to the resolved site root; replacing non-empty content needs
+both `replace:true` and `confirm:true`.
+
+## TLS and backups
+
+`tls_get_status` reports the active leaf certificate's issuer, subject, serial,
+expiry, SANs, vhost/CloudPanel-record consistency, and an expiry-based
+`renewal_health`. It deliberately does not claim that a renewal job succeeded,
+because CloudPanel has no reliable renewal-history primitive.
+
+Backups are encrypted local recovery objects, not network downloads. They can
+contain files, CloudPanel-related databases, or both. They expire after seven
+days and share a 10 GiB retention quota. Restore always creates a matching
+pre-restore safety backup first, then requires explicit confirmation and the
+local `backup.restore` policy.

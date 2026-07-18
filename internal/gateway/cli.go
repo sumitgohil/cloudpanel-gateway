@@ -66,7 +66,7 @@ func NewRootCommand() *cobra.Command {
 		defer s.Close()
 		return ListenNginxCommit(cmd.Context(), c)
 	}})
-	root.AddCommand(bootstrapCmd(load), tokenCmd(load), policyCmd(load), domainCmd(load), settingsCmd(load), doctorCmd(load), serviceCmd(load), completionCmd(root))
+	root.AddCommand(bootstrapCmd(load), tokenCmd(load), policyCmd(load), domainCmd(load), settingsCmd(load), tlsCmd(load), fileCmd(load), backupCmd(load), doctorCmd(load), serviceCmd(load), completionCmd(root))
 	root.AddCommand(&cobra.Command{Use: "version", Short: "Print version", Run: func(cmd *cobra.Command, args []string) { fmt.Fprintln(cmd.OutOrStdout(), Version) }})
 	return root
 }
@@ -220,10 +220,11 @@ func policyCmd(load stateLoader) *cobra.Command {
 				return e
 			}
 			spec, ok := Actions[op]
-			if !ok {
+			managed := op == "file.deploy_artifact" || op == "backup.restore"
+			if !ok && !managed {
 				return errors.New("unknown operation")
 			}
-			if !spec.Dangerous {
+			if ok && !spec.Dangerous && !managed {
 				return errors.New("only dangerous operations are policy controlled")
 			}
 			_, s, e := load(false)
@@ -252,6 +253,10 @@ func policyCmd(load stateLoader) *cobra.Command {
 				v, _ := s.Allowed(n)
 				out[n] = v
 			}
+		}
+		for _, n := range []string{"file.deploy_artifact", "backup.restore"} {
+			v, _ := s.Allowed(n)
+			out[n] = v
 		}
 		return json.NewEncoder(cmd.OutOrStdout()).Encode(out)
 	}}
@@ -512,6 +517,85 @@ func settingsCmd(load stateLoader) *cobra.Command {
 	return cmd
 }
 
+func typedLocalCall(load stateLoader, cmd *cobra.Command, request HelperRequest) error {
+	if err := requireRoot(); err != nil {
+		return err
+	}
+	c, s, err := load(false)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	var out any
+	if err = CallTypedHelper(cmd.Context(), c, request, &out); err != nil {
+		return err
+	}
+	return json.NewEncoder(cmd.OutOrStdout()).Encode(out)
+}
+
+func tlsCmd(load stateLoader) *cobra.Command {
+	cmd := &cobra.Command{Use: "tls", Short: "Read active TLS certificate status without exposing key material"}
+	var domain string
+	status := &cobra.Command{Use: "status", Short: "Show issuer, expiry, SANs, consistency, and expiry-based renewal health", RunE: func(c *cobra.Command, args []string) error {
+		return typedLocalCall(load, c, HelperRequest{TLS: &TLSRequest{Domain: domain}})
+	}}
+	status.Flags().StringVar(&domain, "domain", "", "site domain")
+	_ = status.MarkFlagRequired("domain")
+	cmd.AddCommand(status)
+	return cmd
+}
+
+func fileCmd(load stateLoader) *cobra.Command {
+	cmd := &cobra.Command{Use: "file", Short: "Safely deploy managed artifacts"}
+	var domain, artifact, target string
+	var replace, confirm bool
+	deploy := &cobra.Command{Use: "deploy-artifact", Short: "Deploy a managed ZIP artifact to a site-root-relative directory", Example: "cloudpanel-gateway file deploy-artifact --domain example.com --artifact-id artifact_x --target-dir releases/current", RunE: func(c *cobra.Command, args []string) error {
+		return typedLocalCall(load, c, HelperRequest{Deploy: &DeployRequest{Domain: domain, ArtifactID: artifact, TargetDir: target, Replace: replace, Confirm: confirm}})
+	}}
+	deploy.Flags().StringVar(&domain, "domain", "", "site domain")
+	deploy.Flags().StringVar(&artifact, "artifact-id", "", "managed artifact ID")
+	deploy.Flags().StringVar(&target, "target-dir", "", "site-root-relative target directory")
+	deploy.Flags().BoolVar(&replace, "replace", false, "replace a non-empty target only with --confirm")
+	deploy.Flags().BoolVar(&confirm, "confirm", false, "confirm replacement")
+	_ = deploy.MarkFlagRequired("domain")
+	_ = deploy.MarkFlagRequired("artifact-id")
+	_ = deploy.MarkFlagRequired("target-dir")
+	cmd.AddCommand(deploy)
+	return cmd
+}
+
+func backupCmd(load stateLoader) *cobra.Command {
+	cmd := &cobra.Command{Use: "backup", Short: "Create, list, and restore encrypted managed site backups"}
+	var domain, components string
+	create := &cobra.Command{Use: "create", Short: "Create an encrypted local backup", RunE: func(c *cobra.Command, args []string) error {
+		return typedLocalCall(load, c, HelperRequest{Backup: &BackupRequest{Operation: "create", Domain: domain, Components: components}})
+	}}
+	create.Flags().StringVar(&domain, "domain", "", "site domain")
+	create.Flags().StringVar(&components, "components", "", "files, databases, or both")
+	_ = create.MarkFlagRequired("domain")
+	_ = create.MarkFlagRequired("components")
+	var listDomain string
+	list := &cobra.Command{Use: "list", Short: "List managed encrypted backups and retention", RunE: func(c *cobra.Command, args []string) error {
+		return typedLocalCall(load, c, HelperRequest{Backup: &BackupRequest{Operation: "list", Domain: listDomain}})
+	}}
+	list.Flags().StringVar(&listDomain, "domain", "", "site domain")
+	_ = list.MarkFlagRequired("domain")
+	var restoreDomain, backupID, restoreComponents string
+	var confirm bool
+	restore := &cobra.Command{Use: "restore", Short: "Restore selected components after a mandatory safety backup", RunE: func(c *cobra.Command, args []string) error {
+		return typedLocalCall(load, c, HelperRequest{Backup: &BackupRequest{Operation: "restore", Domain: restoreDomain, BackupID: backupID, Components: restoreComponents, Confirm: confirm}})
+	}}
+	restore.Flags().StringVar(&restoreDomain, "domain", "", "site domain")
+	restore.Flags().StringVar(&backupID, "backup-id", "", "managed backup ID")
+	restore.Flags().StringVar(&restoreComponents, "components", "", "files, databases, or both")
+	restore.Flags().BoolVar(&confirm, "confirm", false, "confirm restore")
+	_ = restore.MarkFlagRequired("domain")
+	_ = restore.MarkFlagRequired("backup-id")
+	_ = restore.MarkFlagRequired("components")
+	cmd.AddCommand(create, list, restore)
+	return cmd
+}
+
 func parseSetValues(items []string) (map[string]string, error) {
 	out := map[string]string{}
 	for _, item := range items {
@@ -575,7 +659,10 @@ type httpServer struct {
 }
 
 func (s *httpServer) run(ctx context.Context) error {
-	srv := &http.Server{Addr: s.addr, Handler: s.handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 20 * time.Second, WriteTimeout: 95 * time.Second, IdleTimeout: 60 * time.Second}
+	// Deployments are bounded to 100 MiB and backups have a helper-enforced
+	// 15-minute ceiling. These timeouts keep those legitimate operations from
+	// being cut off while the request body and helper protocols stay bounded.
+	srv := &http.Server{Addr: s.addr, Handler: s.handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Minute, WriteTimeout: 16 * time.Minute, IdleTimeout: 60 * time.Second}
 	done := make(chan error, 1)
 	go func() { done <- srv.ListenAndServe() }()
 	select {
