@@ -414,18 +414,39 @@ type HelperRequest struct {
 	Version int               `json:"version"`
 	Action  string            `json:"action"`
 	Args    map[string]string `json:"args"`
+	Log     *LogRequest       `json:"log,omitempty"`
 }
 type HelperResponse struct {
-	OK       bool   `json:"ok"`
-	Stdout   string `json:"stdout,omitempty"`
-	Stderr   string `json:"stderr,omitempty"`
-	ExitCode int    `json:"exit_code"`
-	Error    string `json:"error,omitempty"`
+	OK       bool            `json:"ok"`
+	Stdout   string          `json:"stdout,omitempty"`
+	Stderr   string          `json:"stderr,omitempty"`
+	ExitCode int             `json:"exit_code"`
+	Error    string          `json:"error,omitempty"`
+	Data     json.RawMessage `json:"data,omitempty"`
 }
 
 func Execute(ctx context.Context, c Config, s *State, req HelperRequest) HelperResponse {
 	if req.Version != ProtocolVersion {
 		return HelperResponse{Error: "unsupported helper protocol"}
+	}
+	if req.Log != nil {
+		var value any
+		var err error
+		if req.Log.ListSources {
+			var sources []LogSource
+			sources, err = listLogSources(*req.Log)
+			value = LogSourcesResult{Domain: req.Log.Domain, Sources: sources}
+		} else {
+			value, err = readLogs(*req.Log)
+		}
+		if err != nil {
+			return HelperResponse{Error: err.Error()}
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			return HelperResponse{Error: "encode log result"}
+		}
+		return HelperResponse{OK: true, Data: data}
 	}
 	spec, e := ValidateAction(req.Action, req.Args, c.ArtifactDir)
 	if e != nil {
@@ -518,10 +539,58 @@ func CallHelper(ctx context.Context, c Config, action string, args map[string]st
 		return HelperResponse{}, e
 	}
 	defer conn.Close()
-	if e = json.NewEncoder(conn).Encode(HelperRequest{ProtocolVersion, action, args}); e != nil {
+	if e = json.NewEncoder(conn).Encode(HelperRequest{Version: ProtocolVersion, Action: action, Args: args}); e != nil {
 		return HelperResponse{}, e
 	}
 	var r HelperResponse
 	e = json.NewDecoder(io.LimitReader(conn, 8<<20)).Decode(&r)
 	return r, e
+}
+func CallLogHelper(ctx context.Context, c Config, request LogRequest) (LogResult, error) {
+	d := net.Dialer{Timeout: 5 * time.Second}
+	conn, e := d.DialContext(ctx, "unix", c.HelperSocket)
+	if e != nil {
+		return LogResult{}, e
+	}
+	defer conn.Close()
+	if e = json.NewEncoder(conn).Encode(HelperRequest{Version: ProtocolVersion, Log: &request}); e != nil {
+		return LogResult{}, e
+	}
+	var response HelperResponse
+	if e = json.NewDecoder(io.LimitReader(conn, 12<<20)).Decode(&response); e != nil {
+		return LogResult{}, e
+	}
+	if !response.OK {
+		return LogResult{}, errors.New(response.Error)
+	}
+	var result LogResult
+	if e = json.Unmarshal(response.Data, &result); e != nil {
+		return LogResult{}, e
+	}
+	return result, nil
+}
+
+func CallLogSourcesHelper(ctx context.Context, c Config, domain, appLogPath string) (LogSourcesResult, error) {
+	d := net.Dialer{Timeout: 5 * time.Second}
+	conn, e := d.DialContext(ctx, "unix", c.HelperSocket)
+	if e != nil {
+		return LogSourcesResult{}, e
+	}
+	defer conn.Close()
+	request := LogRequest{Domain: domain, AppLogPath: appLogPath, ListSources: true}
+	if e = json.NewEncoder(conn).Encode(HelperRequest{Version: ProtocolVersion, Log: &request}); e != nil {
+		return LogSourcesResult{}, e
+	}
+	var response HelperResponse
+	if e = json.NewDecoder(io.LimitReader(conn, 12<<20)).Decode(&response); e != nil {
+		return LogSourcesResult{}, e
+	}
+	if !response.OK {
+		return LogSourcesResult{}, errors.New(response.Error)
+	}
+	var result LogSourcesResult
+	if e = json.Unmarshal(response.Data, &result); e != nil {
+		return LogSourcesResult{}, e
+	}
+	return result, nil
 }
