@@ -62,7 +62,7 @@ root access, and an FQDN that resolves to the server.
    ```bash
    sudo cloudpanel-gateway token create \
      --label developer-agent \
-     --scopes 'sites:read,sites:write,logs:read,php:read,php:write,pagespeed:read,pagespeed:write,cache:purge,certificates:write,tls:read,artifacts:write,files:write,backups:read,backups:write'
+     --scopes 'sites:read,sites:write,logs:read,php:read,php:write,pagespeed:read,pagespeed:write,cache:purge,certificates:write,tls:read,artifacts:write,files:write,backups:read,backups:write,node:read,node:write,node:deploy,node:build'
    ```
 
 See [installation](docs/installation.md), [usage](docs/usage.md), and
@@ -99,6 +99,7 @@ enabled. Read [the security model](docs/security.md) before production use.
 | Site settings | Site facts/TLS/drift, guarded root directory update, one-time site-user password rotation, safe PHP limits/directives, and PageSpeed controls. |
 | Logs | Source discovery, bounded queries, redaction, gzip rotation support, and deterministic diagnosis signals. |
 | Recovery | TLS health inspection, MCP-managed ZIP upload/deployment, and encrypted files/databases backups retained locally for seven days (10 GiB total). |
+| Applications | Static/Vite/Astro releases, optional SPA fallback routing, and policy-gated Node.js/SSR releases managed by hardened per-site systemd units. |
 
 The exact request schema is published by the running gateway at `/openapi.json`.
 The MCP server describes its typed tools during tool discovery.
@@ -125,6 +126,7 @@ Important command groups:
 - `settings php get|update`
 - `settings pagespeed get|update|purge`
 - `tls status`, `file deploy-artifact`, and `backup create|list|restore`
+- `node settings|status|update-settings|deploy-release|releases|rollback|restart`
 - `doctor`, `service`, `version`, and `completion`
 
 ## REST and MCP

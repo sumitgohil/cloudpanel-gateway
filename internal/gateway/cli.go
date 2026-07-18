@@ -66,7 +66,7 @@ func NewRootCommand() *cobra.Command {
 		defer s.Close()
 		return ListenNginxCommit(cmd.Context(), c)
 	}})
-	root.AddCommand(bootstrapCmd(load), tokenCmd(load), policyCmd(load), domainCmd(load), settingsCmd(load), tlsCmd(load), fileCmd(load), backupCmd(load), doctorCmd(load), serviceCmd(load), completionCmd(root))
+	root.AddCommand(bootstrapCmd(load), tokenCmd(load), policyCmd(load), domainCmd(load), settingsCmd(load), tlsCmd(load), fileCmd(load), backupCmd(load), nodeCmd(load), doctorCmd(load), serviceCmd(load), completionCmd(root))
 	root.AddCommand(&cobra.Command{Use: "version", Short: "Print version", Run: func(cmd *cobra.Command, args []string) { fmt.Fprintln(cmd.OutOrStdout(), Version) }})
 	return root
 }
@@ -220,7 +220,7 @@ func policyCmd(load stateLoader) *cobra.Command {
 				return e
 			}
 			spec, ok := Actions[op]
-			managed := op == "file.deploy_artifact" || op == "file.deploy_root" || op == "backup.restore"
+			managed := op == "file.deploy_artifact" || op == "file.deploy_root" || op == "backup.restore" || op == "node.server_build" || op == "node.deploy_release" || op == "node.runtime_manage"
 			if !ok && !managed {
 				return errors.New("unknown operation")
 			}
@@ -254,7 +254,7 @@ func policyCmd(load stateLoader) *cobra.Command {
 				out[n] = v
 			}
 		}
-		for _, n := range []string{"file.deploy_artifact", "file.deploy_root", "backup.restore"} {
+		for _, n := range []string{"file.deploy_artifact", "file.deploy_root", "backup.restore", "node.server_build", "node.deploy_release", "node.runtime_manage"} {
 			v, _ := s.Allowed(n)
 			out[n] = v
 		}
@@ -604,6 +604,44 @@ func backupCmd(load stateLoader) *cobra.Command {
 	_ = restore.MarkFlagRequired("backup-id")
 	_ = restore.MarkFlagRequired("components")
 	cmd.AddCommand(create, list, restore)
+	return cmd
+}
+
+func nodeCmd(load stateLoader) *cobra.Command {
+	cmd := &cobra.Command{Use: "node", Short: "Manage CloudPanel Node.js releases and generated systemd services"}
+	var domain, artifact, framework, entrypoint, version, health, revision string
+	var args []string
+	var port int
+	var confirm bool
+	call := func(operation string, c *cobra.Command) error {
+		return typedLocalCall(load, c, HelperRequest{Node: &NodeRequest{Operation: operation, Domain: domain, ArtifactID: artifact, Framework: framework, Entrypoint: entrypoint, Args: args, NodeVersion: version, AppPort: port, HealthPath: health, IfMatchRevision: revision, Confirm: confirm}})
+	}
+	get := &cobra.Command{Use: "settings", Short: "Show CloudPanel Node.js version, app port, and gateway revision", RunE: func(c *cobra.Command, _ []string) error { return call(nodeGetSettings, c) }}
+	status := &cobra.Command{Use: "status", Short: "Show generated service and loopback readiness", RunE: func(c *cobra.Command, _ []string) error { return call(nodeStatus, c) }}
+	update := &cobra.Command{Use: "update-settings", Short: "Update the managed runtime settings after an explicit confirmation", RunE: func(c *cobra.Command, _ []string) error { return call(nodeUpdate, c) }}
+	deploy := &cobra.Command{Use: "deploy-release", Short: "Deploy a managed Node.js ZIP artifact as an atomic release", RunE: func(c *cobra.Command, _ []string) error { return call(nodeDeploy, c) }}
+	restart := &cobra.Command{Use: "restart", Short: "Restart the generated Node.js service", RunE: func(c *cobra.Command, _ []string) error { return call(nodeRestart, c) }}
+	list := &cobra.Command{Use: "releases", Short: "List retained Node.js releases", RunE: func(c *cobra.Command, _ []string) error { return call(nodeList, c) }}
+	rollback := &cobra.Command{Use: "rollback", Short: "Activate the previous Node.js release", RunE: func(c *cobra.Command, _ []string) error { return call(nodeRollback, c) }}
+	for _, c := range []*cobra.Command{get, status, update, deploy, restart, list, rollback} {
+		c.Flags().StringVar(&domain, "domain", "", "CloudPanel Node.js domain")
+		_ = c.MarkFlagRequired("domain")
+	}
+	update.Flags().StringVar(&version, "node-version", "", "CloudPanel Node.js version")
+	update.Flags().IntVar(&port, "app-port", 0, "loopback application port")
+	update.Flags().StringVar(&health, "health-path", "", "optional HTTP health path")
+	update.Flags().StringVar(&revision, "if-match-revision", "", "current Node.js settings revision")
+	update.Flags().BoolVar(&confirm, "confirm", false, "confirm runtime change")
+	deploy.Flags().StringVar(&artifact, "artifact-id", "", "managed artifact ID")
+	deploy.Flags().StringVar(&framework, "framework", "generic-node", "generic-node, astro, next-standalone, or nuxt-node")
+	deploy.Flags().StringVar(&entrypoint, "entrypoint", "", "relative .js/.mjs/.cjs entrypoint")
+	deploy.Flags().StringSliceVar(&args, "arg", nil, "safe Node.js argument; repeat as needed")
+	deploy.Flags().StringVar(&health, "health-path", "", "optional HTTP health path")
+	_ = deploy.MarkFlagRequired("artifact-id")
+	_ = deploy.MarkFlagRequired("entrypoint")
+	restart.Flags().BoolVar(&confirm, "confirm", false, "confirm restart")
+	rollback.Flags().BoolVar(&confirm, "confirm", false, "confirm rollback")
+	cmd.AddCommand(get, status, update, deploy, restart, list, rollback)
 	return cmd
 }
 

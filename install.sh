@@ -67,7 +67,7 @@ else
 fi
 
 install -d -m 0755 /etc/cloudpanel-gateway
-install -d -m 0750 /var/lib/cloudpanel-gateway/artifacts /run/cloudpanel-gateway
+install -d -m 0750 /var/lib/cloudpanel-gateway/artifacts /var/lib/cloudpanel-gateway/builds /run/cloudpanel-gateway
 # Backups and their encryption key are intentionally root-only: the public
 # gateway can only request typed helper operations and never read archives.
 install -d -m 0700 /var/lib/cloudpanel-gateway/backups
@@ -75,12 +75,12 @@ if ! id -u cloudpanel-gateway >/dev/null 2>&1; then
   useradd --system --home-dir /var/lib/cloudpanel-gateway --shell /usr/sbin/nologin cloudpanel-gateway
 fi
 gateway_gid="$(id -g cloudpanel-gateway)"
-chown cloudpanel-gateway:cloudpanel-gateway /var/lib/cloudpanel-gateway /var/lib/cloudpanel-gateway/artifacts
+chown cloudpanel-gateway:cloudpanel-gateway /var/lib/cloudpanel-gateway /var/lib/cloudpanel-gateway/artifacts /var/lib/cloudpanel-gateway/builds
 chown root:root /var/lib/cloudpanel-gateway/backups
 install -m 0755 "$binary" /usr/local/bin/cloudpanel-gateway
 if [[ ! -f /etc/cloudpanel-gateway/config.json ]]; then
   cat > /etc/cloudpanel-gateway/config.json <<EOF
-{"listen":"127.0.0.1:9780","helper_socket":"/run/cloudpanel-gateway/helper.sock","helper_gid":${gateway_gid},"database":"/var/lib/cloudpanel-gateway/state.db","artifact_dir":"/var/lib/cloudpanel-gateway/artifacts","secret_file":"/var/lib/cloudpanel-gateway/token-pepper","allowed_hosts":[]}
+{"listen":"127.0.0.1:9780","helper_socket":"/run/cloudpanel-gateway/helper.sock","helper_gid":${gateway_gid},"database":"/var/lib/cloudpanel-gateway/state.db","artifact_dir":"/var/lib/cloudpanel-gateway/artifacts","build_dir":"/var/lib/cloudpanel-gateway/builds","secret_file":"/var/lib/cloudpanel-gateway/token-pepper","allowed_hosts":[]}
 EOF
   # The config contains no credential material; the token pepper is a separate
   # root:gateway-readable file. The unprivileged service must read this file.

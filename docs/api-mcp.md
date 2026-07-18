@@ -128,3 +128,26 @@ contain files, CloudPanel-related databases, or both. They expire after seven
 days and share a 10 GiB retention quota. Restore always creates a matching
 pre-restore safety backup first, then requires explicit confirmation and the
 local `backup.restore` policy.
+
+## Static and Node.js releases
+
+Static sites add `static_get_settings`, `static_update_routing`, and
+`static_deploy_release`. The routing tool only edits its own managed SPA
+fallback block and uses the Nginx validation/commit service.
+
+Node.js adds `project_inspect_artifact`, `site_build_release`,
+`node_get_settings`, `node_update_settings`, `node_get_status`,
+`node_restart`, `node_deploy_release`, `node_list_releases`, and
+`node_rollback_release`. Node releases use `node:read`, `node:write`,
+`node:deploy`, and `node:build` scopes as appropriate. Server builds require
+the locally enabled `node.server_build` policy; activation requires
+`node.deploy_release`; runtime changes and restarts require
+`node.runtime_manage`.
+
+The REST equivalents are `POST /v1/projects/inspect`,
+`POST /v1/sites/{domain}/builds`, `GET|PATCH /v1/sites/{domain}/node`,
+`GET /v1/sites/{domain}/node/status`, `POST /v1/sites/{domain}/node/restart`,
+`GET|POST /v1/sites/{domain}/node/releases`,
+`POST /v1/sites/{domain}/node/rollback`, and
+`GET|PATCH /v1/sites/{domain}/static` plus
+`POST /v1/sites/{domain}/static/deploy`.

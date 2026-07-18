@@ -87,6 +87,7 @@ type DeployRequest struct {
 	Confirm      bool   `json:"confirm"`
 	OwnerTokenID string `json:"owner_token_id"`
 	Root         bool   `json:"root"`
+	Static       bool   `json:"static"`
 }
 type DeploymentResult struct {
 	Domain         string `json:"domain"`
@@ -367,6 +368,21 @@ func deployArtifact(ctx context.Context, c Config, s *State, r DeployRequest) (D
 	}
 	if r.ArtifactID == "" || len(r.ArtifactID) > 100 {
 		return DeploymentResult{}, errors.New("invalid artifact ID")
+	}
+	if r.Static {
+		db, err := openCloudPanelDB(c.CloudPanelDatabase)
+		if err != nil {
+			return DeploymentResult{}, err
+		}
+		defer db.Close()
+		site, err := readCloudPanelSite(ctx, db, r.Domain)
+		if err != nil {
+			return DeploymentResult{}, err
+		}
+		if site.Type != "static" {
+			return DeploymentResult{}, errors.New("static release deployment requires a CloudPanel static site")
+		}
+		r.Root = true
 	}
 	if !r.Root && r.TargetDir == "" {
 		return DeploymentResult{}, errors.New("target_dir is required")
