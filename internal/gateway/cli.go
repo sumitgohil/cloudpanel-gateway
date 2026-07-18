@@ -17,7 +17,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const Version = "0.1.0"
+// Version is replaced by the release workflow with -ldflags. Source builds
+// intentionally report dev rather than claiming to be a released version.
+var Version = "dev"
 
 func NewRootCommand() *cobra.Command {
 	var configPath string
@@ -583,7 +585,8 @@ func (s *httpServer) run(ctx context.Context) error {
 		}
 		return e
 	case <-ctx.Done():
-		shutdown, _ := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 		return srv.Shutdown(shutdown)
 	}
 }

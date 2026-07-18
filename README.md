@@ -1,48 +1,166 @@
 # CloudPanel Gateway
 
-CloudPanel Gateway is a Go API, MCP, and local administration CLI for the CloudPanel `clpctl` CLI. It never runs a shell command: every operation is a typed, validated action executed by a root-only local helper.
+CloudPanel Gateway is a security-focused Go service that turns the CloudPanel
+`clpctl` command line into a scoped REST API, a Streamable HTTP MCP server, and
+a root-only local administration CLI. It is designed for operators and AI
+clients that need useful CloudPanel automation without exposing arbitrary shell
+or `clpctl` execution to the network.
 
-## Local development
+> This is an independent project and is not affiliated with CloudPanel.
+
+## Highlights
+
+- One statically compiled Go binary for Linux `amd64` and `arm64`.
+- Authenticated REST (`/v1`), OpenAPI (`/openapi.json`), docs (`/docs`),
+  metrics (`/metrics`), and MCP Streamable HTTP (`/mcp`).
+- Opaque bearer tokens with keyed hashes at rest, scopes, expiry, rotation,
+  revocation, last-use tracking, and durable redacted auditing.
+- A non-networked root helper that accepts only versioned, typed requests and
+  executes a fixed allowlist through argument arrays—never a shell.
+- A separate root-only Nginx validation/commit service for settings changes.
+- Safe CloudPanel site, user, database, certificate, Varnish, Cloudflare, and
+  vhost-template operations.
+- Read-only site log investigation and deterministic diagnostics for Nginx,
+  PHP, rotated logs, and common framework application logs.
+- Revision-guarded site-root, PHP, PageSpeed, and site-user password controls.
+
+## Quick start
+
+Prerequisites: a supported CloudPanel installation on Ubuntu 24.04, `clpctl`,
+root access, and an FQDN that resolves to the server.
+
+1. Download this repository at the release you intend to install. The release
+   installer downloads the signed architecture-specific binary, verifies its
+   SHA-256 checksum and Minisign signature, and installs the included units.
+
+   ```bash
+   git clone https://github.com/sumitgohil/cloudpanel-gateway.git
+   cd cloudpanel-gateway
+   git checkout v0.1.0
+   sudo ./install.sh --version 0.1.0
+   ```
+
+2. Read and immediately secure the one-time bootstrap token:
+
+   ```bash
+   sudo cat /root/cloudpanel-gateway-bootstrap-token.txt
+   sudo rm /root/cloudpanel-gateway-bootstrap-token.txt
+   ```
+
+3. Map the public gateway hostname, then explicitly issue TLS:
+
+   ```bash
+   sudo cloudpanel-gateway domain map --domain panel.example.com --expected-ip 203.0.113.10
+   sudo cloudpanel-gateway domain tls issue --domain panel.example.com
+   ```
+
+4. Create a least-privilege token for a client. Plaintext tokens are shown only
+   at creation or rotation time.
+
+   ```bash
+   sudo cloudpanel-gateway token create \
+     --label developer-agent \
+     --scopes 'sites:read,sites:write,logs:read,php:read,php:write,pagespeed:read,pagespeed:write,cache:purge,certificates:write'
+   ```
+
+See [installation](docs/installation.md), [usage](docs/usage.md), and
+[REST and MCP](docs/api-mcp.md) for the complete guide.
+
+## Architecture and safety model
+
+The public service runs as the non-login `cloudpanel-gateway` user and listens
+on loopback by default. A reverse proxy created through CloudPanel exposes it
+on a mapped FQDN. The privileged helper listens only on a restricted Unix
+socket; it validates every typed action a second time before invoking `clpctl`.
+There is no generic command runner in either the REST API or MCP server.
+
+Settings changes use a separate root-only commit socket. It accepts generated,
+validated vhost content only, runs `nginx -t`, reloads Nginx after success, and
+rolls back configuration if validation or reload fails. The public service and
+the main helper keep `NoNewPrivileges=true` and
+`MemoryDenyWriteExecute=true`. The isolated Nginx commit service disables only
+the latter because CloudPanel's `ngx_pagespeed` module requires an executable
+stack when Nginx validates its configuration.
+
+High-risk operations are disabled by server policy until an administrator
+enables them locally. A token still needs its matching scope after policy is
+enabled. Read [the security model](docs/security.md) before production use.
+
+## Capabilities
+
+| Area | What is available |
+| --- | --- |
+| Sites | Create static, PHP, Node.js, Python, and reverse-proxy sites; delete sites; issue Let's Encrypt certificates; install policy-gated manual certificates. |
+| Users | Create, list, delete, reset passwords, and disable MFA for CloudPanel users. |
+| Databases | Create/delete databases plus policy-gated master credential and import/export operations using managed artifacts. |
+| CloudPanel | Basic auth and release channel controls; Cloudflare IP updates; Varnish purge; vhost-template management. |
+| Site settings | Site facts/TLS/drift, guarded root directory update, one-time site-user password rotation, safe PHP limits/directives, and PageSpeed controls. |
+| Logs | Source discovery, bounded queries, redaction, gzip rotation support, and deterministic diagnosis signals. |
+
+The exact request schema is published by the running gateway at `/openapi.json`.
+The MCP server describes its typed tools during tool discovery.
+
+## Local CLI
+
+All state-changing local administration commands require root. Discover the
+current command surface rather than relying on copied flags:
+
+```bash
+sudo cloudpanel-gateway --help
+sudo cloudpanel-gateway token --help
+sudo cloudpanel-gateway settings --help
+sudo cloudpanel-gateway completion zsh > "${fpath[1]}/_cloudpanel-gateway"
+sudo cloudpanel-gateway doctor
+```
+
+Important command groups:
+
+- `token create|list|revoke|rotate`
+- `policy enable|disable|list`
+- `domain map|adopt|status|unmap|tls issue`
+- `settings site settings|root|user rotate-password`
+- `settings php get|update`
+- `settings pagespeed get|update|purge`
+- `doctor`, `service`, `version`, and `completion`
+
+## REST and MCP
+
+Every non-health endpoint requires `Authorization: Bearer cp_live_...`.
+MCP is served at `https://<mapped-domain>/mcp` over Streamable HTTP. A minimal
+Codex-compatible configuration is:
+
+```toml
+[mcp_servers.cloudpanel-gateway]
+url = "https://panel.example.com/mcp"
+bearer_token_env_var = "CLOUDPANEL_GATEWAY_TOKEN"
+```
+
+Do not put the token directly in the configuration file or commit it. Set it in
+the environment of the MCP client. Details, endpoints, scopes, tools, and
+examples are in [docs/api-mcp.md](docs/api-mcp.md).
+
+## Development
 
 ```bash
 go test ./...
-go build -o cloudpanel-gateway ./cmd/cloudpanel-gateway
-./cloudpanel-gateway --config ./dev-config.json bootstrap --bootstrap-token-file ./bootstrap-token.txt
+go vet ./...
+go build ./cmd/cloudpanel-gateway
 ```
 
-`serve` and `helper` are separate service modes. The gateway serves REST at `/v1`, OpenAPI at `/openapi.json`, docs at `/docs`, metrics at `/metrics`, and MCP Streamable HTTP at `/mcp`.
+For the disposable test VM only, `install.sh --local-binary /path/to/binary`
+skips release download verification. It is deliberately unsuitable for a
+production install.
 
-## Site log investigation
+## Contributing and support
 
-The gateway exposes read-only, site-scoped log investigation through REST and MCP. It discovers CloudPanel Nginx and PHP logs plus Laravel, Symfony, WordPress, and site-local application logs. It reads only regular files, follows no path outside the site document root, and bounds requests to seven days, 1,000 returned lines, and an 8 MiB read budget.
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request,
+[SECURITY.md](SECURITY.md) for private vulnerability reporting, and
+[SUPPORT.md](SUPPORT.md) for usage questions. Issue templates are provided for
+bugs and feature proposals. Maintainers should follow the
+[maintainer checklist](docs/maintainers.md).
 
-- MCP tools: `cloudpanel_site_logs_list_sources`, `cloudpanel_site_logs_query`, and `cloudpanel_site_logs_diagnose`
-- REST: `GET /v1/sites/{domain}/logs/sources`, `POST /v1/sites/{domain}/logs/query`, and `POST /v1/sites/{domain}/logs/diagnose`
-- Token scope: `logs:read`; results are redacted by default. `raw: true` is accepted only for an `admin` token.
+## License
 
-For example, issue a least-privilege diagnostic token locally:
+Copyright 2026 CloudPanel Gateway contributors.
 
-```bash
-sudo cloudpanel-gateway token create --label incident-investigation --scopes logs:read
-```
-
-The diagnosis endpoint returns deterministic evidence categories only. It never changes site configuration, files, service state, or CloudPanel resources.
-
-## Production installation
-
-Use a signed release:
-
-```bash
-sudo CPG_MINISIGN_PUBLIC_KEY='...' ./install.sh --version 0.1.0
-```
-
-For the disposable VM only, a prebuilt binary may be passed with `--local-binary`. The installer creates two systemd units and writes the initial token once to `/root/cloudpanel-gateway-bootstrap-token.txt`.
-
-Then create the CloudPanel reverse proxy and explicitly issue TLS:
-
-```bash
-sudo cloudpanel-gateway domain map --domain panel1.psng.tech --expected-ip 212.2.252.221
-sudo cloudpanel-gateway domain tls issue --domain panel1.psng.tech
-```
-
-Run `cloudpanel-gateway --help` and `cloudpanel-gateway <command> --help` for all local administrative commands. Dangerous actions remain disabled until `policy enable --operation <name>` is run locally.
+Licensed under the [Apache License, Version 2.0](LICENSE).

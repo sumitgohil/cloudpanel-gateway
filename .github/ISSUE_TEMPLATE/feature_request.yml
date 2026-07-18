@@ -1,0 +1,26 @@
+name: Feature request
+description: Propose a safe, typed CloudPanel Gateway capability.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Explain the operational outcome, not only an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed API, MCP, or CLI behavior
+      description: Include typed inputs, expected response, scope, and confirmation/idempotency needs.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and rollback considerations
+      description: Identify privileged access, validation, policy gates, audit/redaction, and failure behavior.
+    validations:
+      required: true
