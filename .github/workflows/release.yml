@@ -101,7 +101,7 @@ jobs:
           done
           rm -f minisign.key
       - name: Attest release binaries
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: release/cloudpanel-gateway_*_linux_*
       - name: Create tag and GitHub Release
