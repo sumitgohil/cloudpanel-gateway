@@ -1,38 +1,115 @@
-name: release
+name: Release
+
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semantic version without the v prefix (for example 0.2.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
 jobs:
-  build:
-    strategy:
-      matrix: { goarch: [amd64, arm64] }
+  verify-main:
+    name: Verify main and version
     runs-on: ubuntu-latest
-    permissions: { contents: write, id-token: write, attestations: write }
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          test "${GITHUB_REF}" = "refs/heads/main"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]
+          tag="v$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag"; then
+            echo "tag $tag already exists" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build Linux ${{ matrix.goarch }}
+    needs: verify-main
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: "1.26.x" }
-      - run: go test ./...
-      - name: Build static Linux binary
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+      - name: Test
+        run: go test ./...
+      - name: Build static binary
+        env:
+          VERSION: ${{ inputs.version }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} go build -trimpath -ldflags='-s -w' -o cloudpanel-gateway_${version}_linux_${{ matrix.goarch }} ./cmd/cloudpanel-gateway
-      - name: Sign release asset
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" \
+            go build -trimpath -ldflags="-s -w -X github.com/psng-tech/cloudpanel-gateway/internal/gateway.Version=$VERSION" \
+            -o "cloudpanel-gateway_${VERSION}_linux_${GOARCH}" ./cmd/cloudpanel-gateway
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.goarch }}
+          path: cloudpanel-gateway_${{ inputs.version }}_linux_${{ matrix.goarch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Sign and publish
+    needs: [verify-main, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Install Minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends minisign
+      - name: Sign binaries and checksum manifest
+        working-directory: release
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           test -n "$MINISIGN_SECRET_KEY"
-          sudo apt-get update
-          sudo apt-get install --yes minisign
+          test -n "$MINISIGN_PASSWORD"
           printf '%s' "$MINISIGN_SECRET_KEY" | base64 --decode > minisign.key
           chmod 600 minisign.key
-          minisign -S -s minisign.key -m cloudpanel-gateway_*_linux_${{ matrix.goarch }}
+          sha256sum cloudpanel-gateway_*_linux_* > SHA256SUMS
+          for asset in cloudpanel-gateway_*_linux_* SHA256SUMS; do
+            minisign -S -s minisign.key -m "$asset" -x "$asset.minisig" -P "$MINISIGN_PASSWORD"
+          done
           rm -f minisign.key
-      - uses: actions/attest-build-provenance@v2
+      - name: Attest release binaries
+        uses: actions/attest-build-provenance@v2
         with:
-          subject-path: "cloudpanel-gateway_*_linux_${{ matrix.goarch }}"
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            cloudpanel-gateway_*_linux_${{ matrix.goarch }}
-            cloudpanel-gateway_*_linux_${{ matrix.goarch }}.minisig
+          subject-path: release/cloudpanel-gateway_*_linux_*
+      - name: Create tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify-main.outputs.tag }}
+        run: |
+          gh release create "$TAG" release/* \
+            --target "$GITHUB_SHA" \
+            --title "CloudPanel Gateway $TAG" \
+            --generate-notes
