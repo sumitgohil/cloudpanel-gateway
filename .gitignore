@@ -1,0 +1,21 @@
+# macOS and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Local build and test caches
+.cache/
+cloudpanel-gateway
+dist/
+coverage.out
+
+# Local gateway state and credentials
+*.db
+*.sqlite
+*.sqlite3
+dev-config.json
+bootstrap-token.txt
+*.pem
+*.key
+.env
+.env.*

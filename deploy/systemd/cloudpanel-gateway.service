@@ -1,0 +1,29 @@
+[Unit]
+Description=CloudPanel Gateway API and MCP service
+After=network-online.target cloudpanel-gateway-helper.service
+Wants=network-online.target
+Requires=cloudpanel-gateway-helper.service
+
+[Service]
+Type=simple
+User=cloudpanel-gateway
+Group=cloudpanel-gateway
+ExecStart=/usr/local/bin/cloudpanel-gateway --config /etc/cloudpanel-gateway/config.json serve
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/cloudpanel-gateway /run/cloudpanel-gateway
+
+[Install]
+WantedBy=multi-user.target

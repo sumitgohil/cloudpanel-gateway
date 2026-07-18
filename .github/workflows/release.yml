@@ -1,0 +1,38 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  build:
+    strategy:
+      matrix: { goarch: [amd64, arm64] }
+    runs-on: ubuntu-latest
+    permissions: { contents: write, id-token: write, attestations: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.26.x" }
+      - run: go test ./...
+      - name: Build static Linux binary
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} go build -trimpath -ldflags='-s -w' -o cloudpanel-gateway_${version}_linux_${{ matrix.goarch }} ./cmd/cloudpanel-gateway
+      - name: Sign release asset
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          test -n "$MINISIGN_SECRET_KEY"
+          sudo apt-get update
+          sudo apt-get install --yes minisign
+          printf '%s' "$MINISIGN_SECRET_KEY" | base64 --decode > minisign.key
+          chmod 600 minisign.key
+          minisign -S -s minisign.key -m cloudpanel-gateway_*_linux_${{ matrix.goarch }}
+          rm -f minisign.key
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "cloudpanel-gateway_*_linux_${{ matrix.goarch }}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            cloudpanel-gateway_*_linux_${{ matrix.goarch }}
+            cloudpanel-gateway_*_linux_${{ matrix.goarch }}.minisig
