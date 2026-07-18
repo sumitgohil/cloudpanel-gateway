@@ -89,15 +89,17 @@ jobs:
         working-directory: release
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           test -n "$MINISIGN_SECRET_KEY"
-          test -n "$MINISIGN_PASSWORD"
           printf '%s' "$MINISIGN_SECRET_KEY" | base64 --decode > minisign.key
           chmod 600 minisign.key
+          if ! grep -Fxq 'untrusted comment: minisign encrypted secret key' minisign.key; then
+            echo 'MINISIGN_SECRET_KEY must decode to a Minisign secret key file' >&2
+            exit 1
+          fi
           sha256sum cloudpanel-gateway_*_linux_* > SHA256SUMS
           for asset in cloudpanel-gateway_*_linux_* SHA256SUMS; do
-            minisign -S -s minisign.key -m "$asset" -x "$asset.minisig" -P "$MINISIGN_PASSWORD"
+            minisign -S -W -s minisign.key -m "$asset" -x "$asset.minisig"
           done
           rm -f minisign.key
       - name: Attest release binaries
