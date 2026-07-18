@@ -1,13 +1,14 @@
 # Releases and verification
 
-Releases are created only by the **Release** GitHub Actions workflow when it is
-manually dispatched from `main`. The workflow requires a semantic version
-without a leading `v`, for example `0.2.0`; it creates the matching `v0.2.0`
-tag and GitHub Release.
+Releases are created only from `main`. Change the semantic version in the root
+`VERSION` file (without a leading `v`, for example `0.2.0`) in a pull request.
+When that change reaches `main`, the **Release** workflow creates the matching
+`v0.2.0` tag and GitHub Release. It may also be manually dispatched from
+`main` when `VERSION` has already been updated.
 
-Each release contains Linux `amd64` and `arm64` binaries, a `SHA256SUMS`
-manifest, Minisign signatures for every binary and the manifest, and GitHub
-build provenance attestations.
+Each release contains Linux `amd64` and `arm64` installation packages, a
+`SHA256SUMS` manifest, Minisign signatures for every package and the manifest,
+and GitHub build provenance attestations.
 
 ## Maintainer setup
 
@@ -25,7 +26,7 @@ the installer.
 ## Manual verification
 
 ```bash
-minisign -Vm cloudpanel-gateway_0.2.0_linux_amd64 -P "$(sed -n '2p' cloudpanel-gateway.minisign.pub)"
+minisign -Vm cloudpanel-gateway_0.2.0_linux_amd64.tar.gz -P "$(sed -n '2p' cloudpanel-gateway.minisign.pub)"
 minisign -Vm SHA256SUMS -P "$(sed -n '2p' cloudpanel-gateway.minisign.pub)"
 sha256sum --check SHA256SUMS
 ```

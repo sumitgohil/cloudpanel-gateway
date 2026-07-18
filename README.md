@@ -29,16 +29,15 @@ or `clpctl` execution to the network.
 Prerequisites: a supported CloudPanel installation on Ubuntu 24.04, `clpctl`,
 root access, and an FQDN that resolves to the server.
 
-1. Download this repository at the release you intend to install. The release
-   installer downloads the signed architecture-specific binary, verifies its
-   SHA-256 checksum and Minisign signature, and installs the included units.
+1. Run the one-line installer. It discovers the latest GitHub Release,
+   downloads the signed architecture-specific package, verifies its SHA-256
+   checksum and Minisign signature, and installs the included units.
 
    ```bash
-   git clone https://github.com/sumitgohil/cloudpanel-gateway.git
-   cd cloudpanel-gateway
-   git checkout v0.1.0
-   sudo ./install.sh --version 0.1.0
+   curl -fsSL https://raw.githubusercontent.com/sumitgohil/cloudpanel-gateway/main/install.sh | sudo bash
    ```
+
+   To install a specific release, use `sudo bash -s -- --version 0.1.0`.
 
 2. Read and immediately secure the one-time bootstrap token:
 

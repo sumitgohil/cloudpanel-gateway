@@ -1,45 +1,41 @@
 name: Release
 
 on:
+  push:
+    branches: [main]
+    paths: [VERSION]
   workflow_dispatch:
-    inputs:
-      version:
-        description: Semantic version without the v prefix (for example 0.2.0)
-        required: true
-        type: string
 
 permissions:
   contents: read
 
 jobs:
-  verify-main:
-    name: Verify main and version
+  prepare:
+    name: Prepare main release
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
-    permissions:
-      contents: read
     outputs:
+      version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - id: version
-        env:
-          VERSION: ${{ inputs.version }}
         run: |
-          test "${GITHUB_REF}" = "refs/heads/main"
-          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]
-          tag="v$VERSION"
+          version="$(tr -d '[:space:]' < VERSION)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]
+          tag="v$version"
           if git ls-remote --exit-code --tags origin "refs/tags/$tag"; then
-            echo "tag $tag already exists" >&2
+            echo "tag $tag already exists; bump VERSION before releasing" >&2
             exit 1
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build Linux ${{ matrix.goarch }}
-    needs: verify-main
+    needs: prepare
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -53,24 +49,30 @@ jobs:
           check-latest: true
       - name: Test
         run: go test ./...
-      - name: Build static binary
+      - name: Build signed-release package
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
           GOARCH: ${{ matrix.goarch }}
         run: |
+          asset="cloudpanel-gateway_${VERSION}_linux_${GOARCH}"
           CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" \
             go build -trimpath -ldflags="-s -w -X github.com/psng-tech/cloudpanel-gateway/internal/gateway.Version=$VERSION" \
-            -o "cloudpanel-gateway_${VERSION}_linux_${GOARCH}" ./cmd/cloudpanel-gateway
+            -o "$asset" ./cmd/cloudpanel-gateway
+          mkdir -p package/deploy/systemd
+          install -m 0755 "$asset" package/cloudpanel-gateway
+          install -m 0644 deploy/systemd/*.service package/deploy/systemd/
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            -C package -czf "$asset.tar.gz" .
       - uses: actions/upload-artifact@v4
         with:
-          name: binary-${{ matrix.goarch }}
-          path: cloudpanel-gateway_${{ inputs.version }}_linux_${{ matrix.goarch }}
+          name: release-${{ matrix.goarch }}
+          path: cloudpanel-gateway_${{ needs.prepare.outputs.version }}_linux_${{ matrix.goarch }}.tar.gz
           if-no-files-found: error
           retention-days: 1
 
   release:
     name: Sign and publish
-    needs: [verify-main, build]
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -85,7 +87,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends minisign
-      - name: Sign binaries and checksum manifest
+      - name: Sign packages and checksum manifest
         working-directory: release
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
@@ -95,19 +97,19 @@ jobs:
           test -n "$MINISIGN_PASSWORD"
           printf '%s' "$MINISIGN_SECRET_KEY" | base64 --decode > minisign.key
           chmod 600 minisign.key
-          sha256sum cloudpanel-gateway_*_linux_* > SHA256SUMS
-          for asset in cloudpanel-gateway_*_linux_* SHA256SUMS; do
+          sha256sum cloudpanel-gateway_*.tar.gz > SHA256SUMS
+          for asset in cloudpanel-gateway_*.tar.gz SHA256SUMS; do
             minisign -S -s minisign.key -m "$asset" -x "$asset.minisig" -P "$MINISIGN_PASSWORD"
           done
           rm -f minisign.key
-      - name: Attest release binaries
+      - name: Attest release packages
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: release/cloudpanel-gateway_*_linux_*
+          subject-path: release/cloudpanel-gateway_*.tar.gz
       - name: Create tag and GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.verify-main.outputs.tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           gh release create "$TAG" release/* \
             --target "$GITHUB_SHA" \

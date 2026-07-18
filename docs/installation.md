@@ -5,7 +5,7 @@ already installed. Installation must be run as root on the CloudPanel server.
 
 ## What the installer does
 
-The production installer downloads the architecture-specific release binary,
+The production installer downloads the architecture-specific release package,
 verifies `SHA256SUMS` and Minisign signatures using the repository public key,
 then creates the system account, state directories, configuration, and three
 systemd services:
@@ -25,16 +25,16 @@ administrator actions after installation.
 
 ## Production install
 
-Use a checked-out release so the install script has the matching systemd unit
-files. Replace the release below with the version you want to install.
+The one-line installer defaults to the latest signed GitHub Release:
 
 ```bash
-sudo apt-get update
-sudo apt-get install --yes git
-git clone https://github.com/sumitgohil/cloudpanel-gateway.git
-cd cloudpanel-gateway
-git checkout v0.1.0
-sudo ./install.sh --version 0.1.0
+curl -fsSL https://raw.githubusercontent.com/sumitgohil/cloudpanel-gateway/main/install.sh | sudo bash
+```
+
+Install an explicit release by forwarding the version argument to Bash:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sumitgohil/cloudpanel-gateway/main/install.sh | sudo bash -s -- --version 0.1.0
 ```
 
 The embedded public key is used by default. To use an approved replacement key
@@ -94,10 +94,10 @@ require `docs:read`; `/metrics` requires `metrics:read`.
 ## Upgrade and rollback
 
 Back up `/etc/cloudpanel-gateway` and `/var/lib/cloudpanel-gateway` before an
-upgrade. Check out a newer signed release and run the installer again. The
+upgrade. Rerun the one-line installer or specify a newer signed release. The
 state database, token pepper, and existing configuration are retained.
 
-To roll back, check out the previous release and rerun its installer. Confirm
+To roll back, rerun the installer with `--version <previous-version>`. Confirm
 the target version is compatible with the persisted state before changing a
 production host.
 

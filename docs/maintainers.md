@@ -23,14 +23,12 @@ diagnostics.
 
 ## Publishing a release
 
-1. Merge the intended work into `main`.
-2. Open **Actions → Release → Run workflow**.
-3. Select `main` and enter the next semantic version without `v`.
-4. Confirm the generated release contains both architectures, `SHA256SUMS`,
+1. Update `VERSION` to the next semantic version in the release pull request.
+2. Merge the intended work into `main`.
+3. Confirm the generated release contains both architecture packages, `SHA256SUMS`,
    all Minisign signatures, and provenance attestations.
-5. Test the release installer on a disposable CloudPanel VM before announcing
+4. Test the one-line installer on a disposable CloudPanel VM before announcing
    it.
 
-The workflow rejects non-`main` refs and existing version tags. It is manual by
-design: a release is a maintainer decision, not an automatic side effect of
-every merge.
+The workflow rejects non-`main` refs and existing version tags. A release is
+an explicit version bump, not an automatic side effect of every merge.
