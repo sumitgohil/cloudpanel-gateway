@@ -37,6 +37,51 @@ type actionResult struct {
 	ExitCode  int    `json:"exit_code"`
 	RequestID string `json:"request_id"`
 }
+
+type mcpLogSourcesInput struct {
+	Domain string `json:"domain" jsonschema:"The CloudPanel site domain, for example wp1.example.com"`
+}
+
+type mcpLogQueryInput struct {
+	Domain     string   `json:"domain" jsonschema:"The CloudPanel site domain"`
+	Sources    []string `json:"sources,omitempty" jsonschema:"Source IDs from cloudpanel_site_logs_list_sources; defaults to nginx and PHP logs"`
+	AppLogPath string   `json:"app_log_path,omitempty" jsonschema:"Optional log file or directory path relative to the site's document root"`
+	From       string   `json:"from,omitempty" jsonschema:"Inclusive RFC3339 UTC timestamp; defaults to 24 hours ago"`
+	To         string   `json:"to,omitempty" jsonschema:"Inclusive RFC3339 UTC timestamp; defaults to now"`
+	Contains   string   `json:"contains,omitempty" jsonschema:"Optional case-insensitive text filter"`
+	Statuses   []int    `json:"statuses,omitempty" jsonschema:"Optional HTTP status-code filters"`
+	MaxLines   int      `json:"max_lines,omitempty" jsonschema:"Maximum returned lines, 1 through 1000; default 200"`
+	Raw        bool     `json:"raw,omitempty" jsonschema:"Return unredacted log lines; requires an admin token"`
+	Symptom    string   `json:"symptom,omitempty" jsonschema:"Optional user symptom or observed context for the AI client"`
+}
+
+type mcpSiteInput struct {
+	Domain string `json:"domain"`
+}
+type mcpRootInput struct {
+	Domain          string `json:"domain"`
+	RootDirectory   string `json:"root_directory"`
+	IfMatchRevision string `json:"if_match_revision"`
+	Confirm         bool   `json:"confirm"`
+}
+type mcpPasswordInput struct {
+	Domain          string `json:"domain"`
+	IfMatchRevision string `json:"if_match_revision"`
+	Confirm         bool   `json:"confirm"`
+}
+type mcpPHPUpdateInput struct {
+	Domain          string            `json:"domain"`
+	IfMatchRevision string            `json:"if_match_revision"`
+	Values          map[string]string `json:"values"`
+}
+type mcpPageSpeedInput struct {
+	Domain          string   `json:"domain"`
+	IfMatchRevision string   `json:"if_match_revision"`
+	Enabled         bool     `json:"enabled"`
+	Preset          string   `json:"preset"`
+	EnableFilters   []string `json:"enable_filters,omitempty"`
+	DisableFilters  []string `json:"disable_filters,omitempty"`
+}
 type tokenContextKey struct{}
 
 func NewAPIServer(c Config, s *State, logger *slog.Logger) *APIServer {
@@ -60,6 +105,7 @@ func (a *APIServer) Handler() http.Handler {
 	mux.Handle("/mcp", a.mcpAuth(a.mcp))
 	mux.HandleFunc("/v1/artifacts", a.auth(a.artifacts, "artifacts:write"))
 	mux.HandleFunc("/v1/sites", a.auth(a.sites, "sites:write"))
+	mux.HandleFunc("/v1/sites/", a.auth(a.siteLogs, ""))
 	mux.HandleFunc("/v1/actions/", a.auth(a.action, ""))
 	return a.limit(a.requestID(mux))
 }
@@ -271,8 +317,232 @@ func (a *APIServer) artifacts(w http.ResponseWriter, r *http.Request) {
 	}
 	jsonResponse(w, 201, map[string]any{"id": id, "size": n, "expires_in_seconds": 3600})
 }
+
+func (a *APIServer) siteLogs(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/sites/"), "/")
+	if len(parts) >= 2 && parts[1] != "logs" {
+		a.siteSettings(w, r, parts)
+		return
+	}
+	t, _ := r.Context().Value(tokenContextKey{}).(*Token)
+	if t == nil || !HasScope(t, "logs:read") {
+		a.denied.Add(1)
+		jsonError(w, http.StatusForbidden, "insufficient scope", requestID(r))
+		return
+	}
+	if len(parts) != 3 || parts[1] != "logs" || ValidateDomain(parts[0]) != nil {
+		jsonError(w, http.StatusNotFound, "log endpoint not found", requestID(r))
+		return
+	}
+	domain, operation := parts[0], parts[2]
+	switch operation {
+	case "sources":
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		start := time.Now()
+		result, err := CallLogSourcesHelper(r.Context(), a.Config, domain, "")
+		a.auditLogRequest(r, t, "logs.list_sources", "", 0, 0, start, err)
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error(), requestID(r))
+			return
+		}
+		jsonResponse(w, http.StatusOK, result)
+	case "query", "diagnose":
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var input mcpLogQueryInput
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil {
+			jsonError(w, http.StatusBadRequest, "invalid JSON log query", requestID(r))
+			return
+		}
+		if input.Raw && !HasScope(t, "admin") {
+			jsonError(w, http.StatusForbidden, "raw logs require admin scope", requestID(r))
+			return
+		}
+		request := LogRequest{Domain: domain, Sources: input.Sources, AppLogPath: input.AppLogPath, From: input.From, To: input.To, Contains: input.Contains, Statuses: input.Statuses, MaxLines: input.MaxLines, Raw: input.Raw, Symptom: input.Symptom}
+		start := time.Now()
+		result, err := CallLogHelper(r.Context(), a.Config, request)
+		a.auditLogRequest(r, t, "logs."+operation, strings.Join(input.Sources, ","), len(result.Lines), result.Redactions, start, err)
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error(), requestID(r))
+			return
+		}
+		if operation == "query" {
+			result.Signals = nil
+			result.DiagnosisNotice = ""
+		}
+		jsonResponse(w, http.StatusOK, result)
+	default:
+		jsonError(w, http.StatusNotFound, "log endpoint not found", requestID(r))
+	}
+}
+
+func (a *APIServer) siteSettings(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) < 2 || ValidateDomain(parts[0]) != nil {
+		jsonError(w, http.StatusNotFound, "settings endpoint not found", requestID(r))
+		return
+	}
+	domain := parts[0]
+	path := strings.Join(parts[1:], "/")
+	var operation, scope string
+	switch path {
+	case "settings":
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		operation, scope = settingsGet, "sites:read"
+	case "settings/root-directory":
+		if r.Method != http.MethodPatch {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		operation, scope = settingsUpdateRoot, "sites:write"
+	case "settings/site-user/password/rotate":
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		operation, scope = settingsRotatePass, "site-users:write"
+	case "php":
+		if r.Method == http.MethodGet {
+			operation, scope = settingsGetPHP, "php:read"
+		} else if r.Method == http.MethodPatch {
+			operation, scope = settingsUpdatePHP, "php:write"
+		} else {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+	case "pagespeed":
+		if r.Method == http.MethodGet {
+			operation, scope = settingsGetPageSpeed, "pagespeed:read"
+		} else if r.Method == http.MethodPatch {
+			operation, scope = settingsUpdatePS, "pagespeed:write"
+		} else {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+	case "pagespeed/purge":
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		operation, scope = settingsPurgePS, "cache:purge"
+	default:
+		jsonError(w, http.StatusNotFound, "settings endpoint not found", requestID(r))
+		return
+	}
+	t, _ := r.Context().Value(tokenContextKey{}).(*Token)
+	if t == nil || !HasScope(t, scope) {
+		a.denied.Add(1)
+		jsonError(w, http.StatusForbidden, "insufficient scope", requestID(r))
+		return
+	}
+	req := SettingsRequest{Operation: operation, Domain: domain}
+	if r.Method != http.MethodGet {
+		d := json.NewDecoder(r.Body)
+		d.DisallowUnknownFields()
+		if err := d.Decode(&req); err != nil {
+			jsonError(w, http.StatusBadRequest, "invalid JSON settings request", requestID(r))
+			return
+		}
+		req.Operation = operation
+		req.Domain = domain
+	}
+	start := time.Now()
+	var out any
+	err := a.callSettings(r.Context(), req, &out)
+	a.auditSettings(r, t, operation, time.Since(start), err)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "revision conflict") {
+			status = http.StatusConflict
+		}
+		jsonError(w, status, err.Error(), requestID(r))
+		return
+	}
+	jsonResponse(w, http.StatusOK, out)
+}
+
+func (a *APIServer) callSettings(ctx context.Context, request SettingsRequest, out *any) error {
+	var raw json.RawMessage
+	if err := CallSettingsHelper(ctx, a.Config, request, &raw); err != nil {
+		return err
+	}
+	return json.Unmarshal(raw, out)
+}
+func (a *APIServer) auditSettings(r *http.Request, t *Token, action string, d time.Duration, err error) {
+	outcome, detail := "ok", "settings updated"
+	if err != nil {
+		outcome, detail = "error", "settings request failed"
+	}
+	a.State.Audit(requestID(r), t.ID, action, outcome, detail, d)
+}
+
+func (a *APIServer) auditLogRequest(r *http.Request, token *Token, action, sources string, lines, redactions int, start time.Time, err error) {
+	outcome, detail := "ok", fmt.Sprintf("sources=%s lines=%d redactions=%d", sources, lines, redactions)
+	if err != nil {
+		outcome, detail = "error", "log request failed"
+	}
+	a.State.Audit(requestID(r), token.ID, action, outcome, detail, time.Since(start))
+}
 func (a *APIServer) openapi(w http.ResponseWriter, r *http.Request) {
-	jsonResponse(w, 200, map[string]any{"openapi": "3.1.0", "info": map[string]string{"title": "CloudPanel Gateway", "version": "0.1.0"}, "paths": map[string]any{"/v1/sites": map[string]any{"post": map[string]string{"summary": "Create a CloudPanel site"}}, "/v1/actions/{action}": map[string]any{"post": map[string]string{"summary": "Run a documented typed CloudPanel operation"}}, "/mcp": map[string]any{"post": map[string]string{"summary": "MCP Streamable HTTP endpoint"}}}})
+	logRequestSchema := map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
+		"sources":      map[string]any{"type": "array", "items": map[string]string{"type": "string"}, "description": "Source IDs returned by /logs/sources; defaults to Nginx and PHP logs"},
+		"app_log_path": map[string]string{"type": "string", "description": "Optional site-document-root-relative regular file or directory"},
+		"from":         map[string]string{"type": "string", "format": "date-time"},
+		"to":           map[string]string{"type": "string", "format": "date-time"},
+		"contains":     map[string]any{"type": "string", "maxLength": 200},
+		"statuses":     map[string]any{"type": "array", "items": map[string]any{"type": "integer", "minimum": 100, "maximum": 599}},
+		"max_lines":    map[string]any{"type": "integer", "minimum": 1, "maximum": maxLogLines, "default": defaultLogLines},
+		"raw":          map[string]string{"type": "boolean", "description": "Requires admin scope; false returns redacted output"},
+		"symptom":      map[string]any{"type": "string", "maxLength": 500},
+	}}
+	logResponseSchema := map[string]any{"type": "object", "properties": map[string]any{
+		"domain":     map[string]string{"type": "string"},
+		"from":       map[string]string{"type": "string", "format": "date-time"},
+		"to":         map[string]string{"type": "string", "format": "date-time"},
+		"sources":    map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/LogSource"}},
+		"lines":      map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/LogLine"}},
+		"signals":    map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/LogSignal"}},
+		"redactions": map[string]string{"type": "integer"},
+		"bytes_read": map[string]string{"type": "integer"},
+		"truncated":  map[string]string{"type": "boolean"},
+	}}
+	response := func(schema any) map[string]any {
+		return map[string]any{"200": map[string]any{"description": "Success", "content": map[string]any{"application/json": map[string]any{"schema": schema}}}}
+	}
+	jsonResponseSchema := func(schema any) map[string]any {
+		return map[string]any{"application/json": map[string]any{"schema": schema}}
+	}
+	jsonResponse(w, 200, map[string]any{"openapi": "3.1.0", "info": map[string]string{"title": "CloudPanel Gateway", "version": "0.1.0"}, "paths": map[string]any{
+		"/v1/sites":                                             map[string]any{"post": map[string]string{"summary": "Create a CloudPanel site"}},
+		"/v1/actions/{action}":                                  map[string]any{"post": map[string]string{"summary": "Run a documented typed CloudPanel operation"}},
+		"/v1/sites/{domain}/logs/sources":                       map[string]any{"get": map[string]any{"summary": "List safe, site-scoped log sources (requires logs:read)", "responses": response(map[string]any{"type": "object", "properties": map[string]any{"domain": map[string]string{"type": "string"}, "sources": map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/LogSource"}}}})}},
+		"/v1/sites/{domain}/logs/query":                         map[string]any{"post": map[string]any{"summary": "Query bounded site logs (requires logs:read; raw requires admin)", "requestBody": map[string]any{"required": false, "content": jsonResponseSchema(logRequestSchema)}, "responses": response(logResponseSchema)}},
+		"/v1/sites/{domain}/logs/diagnose":                      map[string]any{"post": map[string]any{"summary": "Query site logs with deterministic diagnostic signals", "requestBody": map[string]any{"required": false, "content": jsonResponseSchema(logRequestSchema)}, "responses": response(logResponseSchema)}},
+		"/v1/sites/{domain}/settings":                           map[string]any{"get": map[string]any{"summary": "Read CloudPanel site settings and revision", "responses": response(map[string]any{"$ref": "#/components/schemas/SiteSettings"})}},
+		"/v1/sites/{domain}/settings/root-directory":            map[string]any{"patch": map[string]any{"summary": "Update an htdocs-contained root directory", "responses": response(map[string]any{"$ref": "#/components/schemas/SiteSettings"})}},
+		"/v1/sites/{domain}/settings/site-user/password/rotate": map[string]any{"post": map[string]any{"summary": "Rotate the site account password with confirmation", "responses": response(map[string]any{"$ref": "#/components/schemas/PasswordRotation"})}},
+		"/v1/sites/{domain}/php":                                map[string]any{"get": map[string]any{"summary": "Read safe PHP settings", "responses": response(map[string]any{"$ref": "#/components/schemas/PHPSettings"})}, "patch": map[string]any{"summary": "Update reviewed PHP settings", "responses": response(map[string]any{"$ref": "#/components/schemas/PHPSettings"})}},
+		"/v1/sites/{domain}/pagespeed":                          map[string]any{"get": map[string]any{"summary": "Read PageSpeed settings", "responses": response(map[string]any{"$ref": "#/components/schemas/PageSpeed"})}, "patch": map[string]any{"summary": "Update PageSpeed preset and filters", "responses": response(map[string]any{"$ref": "#/components/schemas/PageSpeed"})}},
+		"/v1/sites/{domain}/pagespeed/purge":                    map[string]any{"post": map[string]any{"summary": "Purge the validated per-site PageSpeed cache", "responses": response(map[string]any{"type": "object"})}},
+		"/mcp":                                                  map[string]any{"post": map[string]string{"summary": "MCP Streamable HTTP endpoint"}},
+	}, "components": map[string]any{"schemas": map[string]any{
+		"LogSource":        map[string]any{"type": "object", "properties": map[string]any{"id": map[string]string{"type": "string"}, "kind": map[string]string{"type": "string"}, "path": map[string]string{"type": "string", "description": "Safe relative path only"}, "rotated": map[string]string{"type": "boolean"}, "size": map[string]string{"type": "integer"}, "modified": map[string]string{"type": "string", "format": "date-time"}}},
+		"LogLine":          map[string]any{"type": "object", "properties": map[string]any{"source": map[string]string{"type": "string"}, "timestamp": map[string]string{"type": "string", "format": "date-time"}, "timestamp_unknown": map[string]string{"type": "boolean"}, "line": map[string]string{"type": "string"}}},
+		"LogSignal":        map[string]any{"type": "object", "properties": map[string]any{"category": map[string]string{"type": "string"}, "count": map[string]string{"type": "integer"}, "sample": map[string]string{"type": "string"}}},
+		"SiteSettings":     map[string]any{"type": "object", "properties": map[string]any{"domain": map[string]string{"type": "string"}, "type": map[string]string{"type": "string"}, "site_user": map[string]string{"type": "string"}, "root_directory": map[string]string{"type": "string"}, "revision": map[string]string{"type": "string"}}},
+		"PHPSettings":      map[string]any{"type": "object", "properties": map[string]any{"applicable": map[string]string{"type": "boolean"}, "php_version": map[string]string{"type": "string"}, "values": map[string]any{"type": "object", "additionalProperties": map[string]string{"type": "string"}}, "revision": map[string]string{"type": "string"}}},
+		"PageSpeed":        map[string]any{"type": "object", "properties": map[string]any{"available": map[string]string{"type": "boolean"}, "enabled": map[string]string{"type": "boolean"}, "preset": map[string]string{"type": "string"}, "revision": map[string]string{"type": "string"}}},
+		"PasswordRotation": map[string]any{"type": "object", "properties": map[string]any{"site_user": map[string]string{"type": "string"}, "password": map[string]string{"type": "string", "writeOnly": "true"}}},
+	}}})
 }
 func (a *APIServer) docs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -311,7 +581,112 @@ func (a *APIServer) newMCP(t *Token) *mcp.Server {
 			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "operation completed"}}}, out{Action: name, Output: res.Stdout, ExitCode: res.ExitCode}, nil
 		})
 	}
+	mcp.AddTool(s, &mcp.Tool{Name: "cloudpanel_site_logs_list_sources", Description: "List the safe, site-scoped Nginx, PHP, rotated, and discovered application log sources for a CloudPanel site. Read-only; requires logs:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, input mcpLogSourcesInput) (*mcp.CallToolResult, LogSourcesResult, error) {
+		if !HasScope(t, "logs:read") {
+			return mcpScopeError(), LogSourcesResult{}, nil
+		}
+		start := time.Now()
+		result, err := CallLogSourcesHelper(ctx, a.Config, input.Domain, "")
+		a.auditMCPLog(t, "logs.list_sources", "", 0, 0, time.Since(start), err)
+		if err != nil {
+			return mcpToolError(err), LogSourcesResult{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "log sources listed"}}}, result, nil
+	})
+	registerLogTool := func(name, description, action string, diagnose bool) {
+		mcp.AddTool(s, &mcp.Tool{Name: name, Description: description}, func(ctx context.Context, _ *mcp.CallToolRequest, input mcpLogQueryInput) (*mcp.CallToolResult, LogResult, error) {
+			if !HasScope(t, "logs:read") {
+				return mcpScopeError(), LogResult{}, nil
+			}
+			if input.Raw && !HasScope(t, "admin") {
+				return mcpToolError(fmt.Errorf("raw logs require admin scope")), LogResult{}, nil
+			}
+			request := LogRequest{Domain: input.Domain, Sources: input.Sources, AppLogPath: input.AppLogPath, From: input.From, To: input.To, Contains: input.Contains, Statuses: input.Statuses, MaxLines: input.MaxLines, Raw: input.Raw, Symptom: input.Symptom}
+			start := time.Now()
+			result, err := CallLogHelper(ctx, a.Config, request)
+			a.auditMCPLog(t, action, strings.Join(input.Sources, ","), len(result.Lines), result.Redactions, time.Since(start), err)
+			if err != nil {
+				return mcpToolError(err), LogResult{}, nil
+			}
+			if !diagnose {
+				result.Signals = nil
+				result.DiagnosisNotice = ""
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "read-only log query completed"}}}, result, nil
+		})
+	}
+	registerLogTool("cloudpanel_site_logs_query", "Read bounded, site-scoped Nginx, PHP, or application log lines. Use source IDs from cloudpanel_site_logs_list_sources. Read-only; requires logs:read. Default output is redacted; raw=true requires admin.", "logs.query", false)
+	registerLogTool("cloudpanel_site_logs_diagnose", "Read bounded site logs and return deterministic evidence categories for HTTP, upstream, PHP, permissions, missing-file, and database failures. Read-only; requires logs:read.", "logs.diagnose", true)
+	settingsCall := func(ctx context.Context, operation, scope string, input SettingsRequest, out any) (*mcp.CallToolResult, error) {
+		if !HasScope(t, scope) {
+			return mcpScopeError(), nil
+		}
+		input.Operation = operation
+		start := time.Now()
+		err := CallSettingsHelper(ctx, a.Config, input, out)
+		a.auditMCPLog(t, operation, "", 0, 0, time.Since(start), err)
+		if err != nil {
+			return mcpToolError(err), nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "settings operation completed"}}}, nil
+	}
+	mcp.AddTool(s, &mcp.Tool{Name: "site_get_settings", Description: "Read CloudPanel site identity, root directory, PHP version, PageSpeed state, TLS status, drift indicators, and revision. Requires sites:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpSiteInput) (*mcp.CallToolResult, SiteSettings, error) {
+		out := SiteSettings{}
+		res, err := settingsCall(ctx, settingsGet, "sites:read", SettingsRequest{Domain: in.Domain}, &out)
+		return res, out, err
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "site_update_root_directory", Description: "Change a site root to an existing htdocs-relative directory. Requires sites:write, the current revision, and confirm=true."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpRootInput) (*mcp.CallToolResult, SiteSettings, error) {
+		out := SiteSettings{}
+		res, err := settingsCall(ctx, settingsUpdateRoot, "sites:write", SettingsRequest{Domain: in.Domain, RootDirectory: in.RootDirectory, IfMatchRevision: in.IfMatchRevision, Confirm: in.Confirm}, &out)
+		return res, out, err
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "site_rotate_user_password", Description: "Generate and set a new SSH/SFTP password for the site account. Returns the secret once. Requires site-users:write, current revision, and confirm=true."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpPasswordInput) (*mcp.CallToolResult, PasswordRotation, error) {
+		out := PasswordRotation{}
+		res, err := settingsCall(ctx, settingsRotatePass, "site-users:write", SettingsRequest{Domain: in.Domain, IfMatchRevision: in.IfMatchRevision, Confirm: in.Confirm}, &out)
+		return res, out, err
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "php_get_settings", Description: "Read safe effective PHP settings for a CloudPanel site. Returns not applicable for non-PHP sites. Requires php:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpSiteInput) (*mcp.CallToolResult, PHPSettings, error) {
+		out := PHPSettings{}
+		res, err := settingsCall(ctx, settingsGetPHP, "php:read", SettingsRequest{Domain: in.Domain}, &out)
+		return res, out, err
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "php_update_settings", Description: "Update reviewed PHP limits and safe directives. Requires php:write and the current revision."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpPHPUpdateInput) (*mcp.CallToolResult, PHPSettings, error) {
+		out := PHPSettings{}
+		res, err := settingsCall(ctx, settingsUpdatePHP, "php:write", SettingsRequest{Domain: in.Domain, IfMatchRevision: in.IfMatchRevision, PHPValues: in.Values}, &out)
+		return res, out, err
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "pagespeed_get_settings", Description: "Read PageSpeed availability, enabled state, filters, and current revision. Requires pagespeed:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpSiteInput) (*mcp.CallToolResult, PageSpeed, error) {
+		out := PageSpeed{}
+		res, err := settingsCall(ctx, settingsGetPageSpeed, "pagespeed:read", SettingsRequest{Domain: in.Domain}, &out)
+		return res, out, err
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "pagespeed_update_settings", Description: "Enable or disable PageSpeed with a reviewed preset and allowlisted filters. Requires pagespeed:write and the current revision."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpPageSpeedInput) (*mcp.CallToolResult, PageSpeed, error) {
+		out := PageSpeed{}
+		res, err := settingsCall(ctx, settingsUpdatePS, "pagespeed:write", SettingsRequest{Domain: in.Domain, IfMatchRevision: in.IfMatchRevision, PageSpeed: &PageSpeedUpdate{Enabled: in.Enabled, Preset: in.Preset, EnableFilters: in.EnableFilters, DisableFilters: in.DisableFilters}}, &out)
+		return res, out, err
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "pagespeed_purge_cache", Description: "Purge only the target site's PageSpeed cache. Requires cache:purge."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpSiteInput) (*mcp.CallToolResult, map[string]any, error) {
+		out := map[string]any{}
+		res, err := settingsCall(ctx, settingsPurgePS, "cache:purge", SettingsRequest{Domain: in.Domain}, &out)
+		return res, out, err
+	})
 	return s
+}
+
+func mcpScopeError() *mcp.CallToolResult {
+	return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: "insufficient scope"}}}
+}
+
+func mcpToolError(err error) *mcp.CallToolResult {
+	return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}}}
+}
+
+func (a *APIServer) auditMCPLog(token *Token, action, sources string, lines, redactions int, duration time.Duration, err error) {
+	outcome, detail := "ok", fmt.Sprintf("sources=%s lines=%d redactions=%d", sources, lines, redactions)
+	if err != nil {
+		outcome, detail = "error", "log request failed"
+	}
+	a.State.Audit("mcp", token.ID, action, outcome, detail, duration)
 }
 func jsonResponse(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")

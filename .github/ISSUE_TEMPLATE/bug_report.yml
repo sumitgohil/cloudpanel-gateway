@@ -1,0 +1,38 @@
+name: Bug report
+description: Report a reproducible problem without exposing secrets or production data.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include tokens, passwords, keys, database credentials, customer data, or unredacted logs. Report security issues privately."
+  - type: input
+    id: version
+    attributes:
+      label: Gateway version
+      placeholder: v0.2.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Ubuntu, CloudPanel, architecture, and deployment mode.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and redacted reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs or request ID
