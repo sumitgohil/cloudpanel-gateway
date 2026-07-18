@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func writeTestZIP(t *testing.T, path string, entries map[string]string) {
@@ -30,6 +31,48 @@ func writeTestZIP(t *testing.T, path string, entries map[string]string) {
 	}
 	if err = f.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestChunkedArtifactUploadOwnershipAndCompletion(t *testing.T) {
+	dir := t.TempDir()
+	c := Config{Database: filepath.Join(dir, "state.db"), SecretFile: filepath.Join(dir, "pepper"), ArtifactDir: filepath.Join(dir, "artifacts")}
+	s, err := OpenState(c, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	a := &APIServer{Config: c, State: s}
+	owner := &Token{ID: "tok_owner"}
+	other := &Token{ID: "tok_other"}
+	zipPath := filepath.Join(dir, "artifact.zip")
+	writeTestZIP(t, zipPath, map[string]string{"index.php": "<?php echo 'safe';"})
+	data, err := os.ReadFile(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := a.beginArtifactUpload(owner, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = a.appendArtifactChunk(other, u.ID, 0, data); err == nil {
+		t.Fatal("expected cross-token upload to be denied")
+	}
+	if _, err = a.appendArtifactChunk(owner, u.ID, 0, data); err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := a.completeArtifactUpload(owner, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifact.ID == "" || artifact.Size != int64(len(data)) {
+		t.Fatalf("bad artifact: %#v", artifact)
+	}
+	if _, err = os.Stat(artifact.Path); err != nil {
+		t.Fatal(err)
+	}
+	if !artifact.ExpiresAt.After(time.Now()) {
+		t.Fatal("artifact should expire in the future")
 	}
 }
 

@@ -220,7 +220,7 @@ func policyCmd(load stateLoader) *cobra.Command {
 				return e
 			}
 			spec, ok := Actions[op]
-			managed := op == "file.deploy_artifact" || op == "backup.restore"
+			managed := op == "file.deploy_artifact" || op == "file.deploy_root" || op == "backup.restore"
 			if !ok && !managed {
 				return errors.New("unknown operation")
 			}
@@ -254,7 +254,7 @@ func policyCmd(load stateLoader) *cobra.Command {
 				out[n] = v
 			}
 		}
-		for _, n := range []string{"file.deploy_artifact", "backup.restore"} {
+		for _, n := range []string{"file.deploy_artifact", "file.deploy_root", "backup.restore"} {
 			v, _ := s.Allowed(n)
 			out[n] = v
 		}
@@ -560,7 +560,18 @@ func fileCmd(load stateLoader) *cobra.Command {
 	_ = deploy.MarkFlagRequired("domain")
 	_ = deploy.MarkFlagRequired("artifact-id")
 	_ = deploy.MarkFlagRequired("target-dir")
-	cmd.AddCommand(deploy)
+	var rootDomain, rootArtifact string
+	var rootReplace, rootConfirm bool
+	rootDeploy := &cobra.Command{Use: "deploy-root-artifact", Short: "Replace a site's active root after creating a mandatory safety backup", Example: "cloudpanel-gateway file deploy-root-artifact --domain example.com --artifact-id artifact_x --replace --confirm", RunE: func(c *cobra.Command, args []string) error {
+		return typedLocalCall(load, c, HelperRequest{Deploy: &DeployRequest{Domain: rootDomain, ArtifactID: rootArtifact, Replace: rootReplace, Confirm: rootConfirm, Root: true}})
+	}}
+	rootDeploy.Flags().StringVar(&rootDomain, "domain", "", "site domain")
+	rootDeploy.Flags().StringVar(&rootArtifact, "artifact-id", "", "managed artifact ID")
+	rootDeploy.Flags().BoolVar(&rootReplace, "replace", false, "required acknowledgement that the active root will be replaced")
+	rootDeploy.Flags().BoolVar(&rootConfirm, "confirm", false, "confirm root replacement")
+	_ = rootDeploy.MarkFlagRequired("domain")
+	_ = rootDeploy.MarkFlagRequired("artifact-id")
+	cmd.AddCommand(deploy, rootDeploy)
 	return cmd
 }
 

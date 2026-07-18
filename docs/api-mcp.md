@@ -14,6 +14,9 @@ TLS-enabled CloudPanel reverse proxy first.
 | `POST /v1/sites` | `sites:write` |
 | `POST /v1/actions/{action}` | Action-specific scope |
 | `POST /v1/artifacts` | `artifacts:write` |
+| `POST /v1/artifacts/uploads/begin` | `artifacts:write` |
+| `POST /v1/artifacts/uploads/{upload_id}/chunk` | `artifacts:write` |
+| `POST /v1/artifacts/uploads/{upload_id}/complete` | `artifacts:write` |
 | `GET /v1/sites/{domain}/logs/sources` | `logs:read` |
 | `POST /v1/sites/{domain}/logs/query` | `logs:read` (`raw` needs `admin`) |
 | `POST /v1/sites/{domain}/logs/diagnose` | `logs:read` |
@@ -25,6 +28,7 @@ TLS-enabled CloudPanel reverse proxy first.
 | `POST /v1/sites/{domain}/pagespeed/purge` | `cache:purge` |
 | `GET /v1/sites/{domain}/tls` | `tls:read` |
 | `POST /v1/sites/{domain}/deployments` | `files:write` + `file.deploy_artifact` policy |
+| `POST /v1/sites/{domain}/deployments/root` | `files:write` + `file.deploy_root` policy + `replace:true` + `confirm:true` |
 | `GET` / `POST /v1/sites/{domain}/backups` | `backups:read` / `backups:write` |
 | `POST /v1/sites/{domain}/backups/{backup_id}/restore` | `backups:write` + `backup.restore` policy + `confirm:true` |
 
@@ -79,6 +83,8 @@ provides these named tools:
   `pagespeed_purge_cache`
 - `tls_get_status`
 - `file_deploy_artifact`
+- `artifact_begin_upload`, `artifact_upload_chunk`, `artifact_complete_upload`
+- `site_deploy_root_artifact`
 - `site_backup_create`, `site_backup_list`, `site_backup_restore`
 
 Tools return structured JSON. A log diagnosis offers deterministic evidence
@@ -98,6 +104,17 @@ ZIP archives up to 100 MiB compressed. Archive traversal, duplicate entries,
 symlinks, devices, and excessive expansion are rejected. The target directory
 must be relative to the resolved site root; replacing non-empty content needs
 both `replace:true` and `confirm:true`.
+
+MCP clients can upload local archives without a shell or external URL by using
+the three upload tools. Begin the upload with its exact number of chunks, send
+sequential base64 chunks of at most 1 MiB, then complete it to receive the
+short-lived `artifact_id`. Upload sessions and artifacts are token-owned and
+expire after one hour.
+
+`site_deploy_root_artifact` is intentionally separate from directory
+deployment. It requires the `file.deploy_root` local policy and both
+`replace:true` and `confirm:true`; before the atomic root-directory swap, the
+root helper creates an encrypted files safety backup.
 
 ## TLS and backups
 

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,6 +29,7 @@ type APIServer struct {
 	requests atomic.Uint64
 	denied   atomic.Uint64
 	mcp      http.Handler
+	uploadMu sync.Mutex
 }
 type actionBody struct {
 	Args map[string]string `json:"args"`
@@ -91,6 +94,12 @@ type mcpDeployInput struct {
 	Replace    bool   `json:"replace"`
 	Confirm    bool   `json:"confirm"`
 }
+type mcpRootDeployInput struct {
+	Domain     string `json:"domain"`
+	ArtifactID string `json:"artifact_id"`
+	Replace    bool   `json:"replace"`
+	Confirm    bool   `json:"confirm"`
+}
 type mcpBackupCreateInput struct {
 	Domain     string `json:"domain"`
 	Components string `json:"components"`
@@ -100,6 +109,17 @@ type mcpBackupRestoreInput struct {
 	BackupID   string `json:"backup_id"`
 	Components string `json:"components"`
 	Confirm    bool   `json:"confirm"`
+}
+type mcpArtifactBeginInput struct {
+	TotalChunks int `json:"total_chunks"`
+}
+type mcpArtifactChunkInput struct {
+	UploadID   string `json:"upload_id"`
+	Index      int    `json:"index"`
+	DataBase64 string `json:"data_base64"`
+}
+type mcpArtifactCompleteInput struct {
+	UploadID string `json:"upload_id"`
 }
 type tokenContextKey struct{}
 
@@ -123,6 +143,7 @@ func (a *APIServer) Handler() http.Handler {
 	mux.HandleFunc("/metrics", a.auth(a.metrics, "metrics:read"))
 	mux.Handle("/mcp", a.mcpAuth(a.mcp))
 	mux.HandleFunc("/v1/artifacts", a.auth(a.artifacts, "artifacts:write"))
+	mux.HandleFunc("/v1/artifacts/uploads/", a.auth(a.artifactUploads, "artifacts:write"))
 	mux.HandleFunc("/v1/sites", a.auth(a.sites, "sites:write"))
 	mux.HandleFunc("/v1/sites/", a.auth(a.siteLogs, ""))
 	mux.HandleFunc("/v1/actions/", a.auth(a.action, ""))
@@ -355,6 +376,11 @@ func (a *APIServer) artifacts(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, 400, "artifact must be a ZIP archive", requestID(r))
 		return
 	}
+	if e = validateArtifactZIP(path); e != nil {
+		_ = os.Remove(path)
+		jsonError(w, 400, e.Error(), requestID(r))
+		return
+	}
 	t, _ := r.Context().Value(tokenContextKey{}).(*Token)
 	now := time.Now().UTC()
 	artifact := Artifact{ID: id, Path: path, SHA256: hex.EncodeToString(h.Sum(nil)), Size: n, OwnerTokenID: t.ID, CreatedAt: now, ExpiresAt: now.Add(artifactTTL)}
@@ -365,6 +391,186 @@ func (a *APIServer) artifacts(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = a.State.CleanupArtifacts(now)
 	jsonResponse(w, 201, map[string]any{"id": id, "sha256": artifact.SHA256, "size": n, "expires_at": artifact.ExpiresAt})
+}
+
+func (a *APIServer) beginArtifactUpload(t *Token, totalChunks int) (ArtifactUpload, error) {
+	if totalChunks < 1 || totalChunks > maxArtifactChunks {
+		return ArtifactUpload{}, fmt.Errorf("total_chunks must be between 1 and %d", maxArtifactChunks)
+	}
+	a.uploadMu.Lock()
+	defer a.uploadMu.Unlock()
+	if err := os.MkdirAll(a.Config.ArtifactDir, 0750); err != nil {
+		return ArtifactUpload{}, err
+	}
+	_ = a.State.CleanupArtifacts(time.Now())
+	id, err := newID("upload_", 18)
+	if err != nil {
+		return ArtifactUpload{}, err
+	}
+	path := filepath.Join(a.Config.ArtifactDir, "."+id+".part")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return ArtifactUpload{}, err
+	}
+	if err = f.Close(); err != nil {
+		return ArtifactUpload{}, err
+	}
+	now := time.Now().UTC()
+	u := ArtifactUpload{ID: id, Path: path, OwnerTokenID: t.ID, TotalChunks: totalChunks, CreatedAt: now, ExpiresAt: now.Add(artifactTTL)}
+	if err = a.State.PutArtifactUpload(u); err != nil {
+		_ = os.Remove(path)
+		return ArtifactUpload{}, err
+	}
+	return u, nil
+}
+func (a *APIServer) appendArtifactChunk(t *Token, id string, index int, data []byte) (ArtifactUpload, error) {
+	if len(data) == 0 || len(data) > maxArtifactChunk {
+		return ArtifactUpload{}, fmt.Errorf("chunk must be 1 through %d bytes", maxArtifactChunk)
+	}
+	a.uploadMu.Lock()
+	defer a.uploadMu.Unlock()
+	u, err := a.State.ArtifactUpload(id)
+	if err != nil {
+		return ArtifactUpload{}, errors.New("upload not found")
+	}
+	if u.OwnerTokenID != t.ID {
+		return ArtifactUpload{}, errors.New("upload is not owned by this token")
+	}
+	if time.Now().After(u.ExpiresAt) {
+		return ArtifactUpload{}, errors.New("upload expired")
+	}
+	if index != u.NextChunk || index >= u.TotalChunks {
+		return ArtifactUpload{}, errors.New("unexpected upload chunk index")
+	}
+	st, err := os.Stat(u.Path)
+	if err != nil || st.Size() != u.Size {
+		return ArtifactUpload{}, errors.New("upload state is inconsistent")
+	}
+	if u.Size+int64(len(data)) > maxZIPCompressed {
+		return ArtifactUpload{}, errors.New("artifact exceeds 100 MiB compressed limit")
+	}
+	f, err := os.OpenFile(u.Path, os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return ArtifactUpload{}, err
+	}
+	_, err = f.Write(data)
+	closeErr := f.Close()
+	if err != nil {
+		return ArtifactUpload{}, err
+	}
+	if closeErr != nil {
+		return ArtifactUpload{}, closeErr
+	}
+	u.Size += int64(len(data))
+	u.NextChunk++
+	if err = a.State.AdvanceArtifactUpload(u.ID, u.Size, u.NextChunk); err != nil {
+		return ArtifactUpload{}, err
+	}
+	return u, nil
+}
+func (a *APIServer) completeArtifactUpload(t *Token, id string) (Artifact, error) {
+	a.uploadMu.Lock()
+	defer a.uploadMu.Unlock()
+	u, err := a.State.ArtifactUpload(id)
+	if err != nil {
+		return Artifact{}, errors.New("upload not found")
+	}
+	if u.OwnerTokenID != t.ID {
+		return Artifact{}, errors.New("upload is not owned by this token")
+	}
+	if time.Now().After(u.ExpiresAt) || u.NextChunk != u.TotalChunks || u.Size < 4 {
+		return Artifact{}, errors.New("upload is incomplete or expired")
+	}
+	if err = validateArtifactZIP(u.Path); err != nil {
+		return Artifact{}, err
+	}
+	f, err := os.Open(u.Path)
+	if err != nil {
+		return Artifact{}, err
+	}
+	h := sha256.New()
+	_, err = io.Copy(h, f)
+	closeErr := f.Close()
+	if err != nil {
+		return Artifact{}, err
+	}
+	if closeErr != nil {
+		return Artifact{}, closeErr
+	}
+	artifactID, err := newID("artifact_", 18)
+	if err != nil {
+		return Artifact{}, err
+	}
+	path := filepath.Join(a.Config.ArtifactDir, artifactID)
+	if err = os.Rename(u.Path, path); err != nil {
+		return Artifact{}, err
+	}
+	now := time.Now().UTC()
+	artifact := Artifact{ID: artifactID, Path: path, SHA256: hex.EncodeToString(h.Sum(nil)), Size: u.Size, OwnerTokenID: t.ID, CreatedAt: now, ExpiresAt: now.Add(artifactTTL)}
+	if err = a.State.PutArtifact(artifact); err != nil {
+		_ = os.Rename(path, u.Path)
+		return Artifact{}, err
+	}
+	if err = a.State.DeleteArtifactUpload(u.ID); err != nil {
+		return Artifact{}, err
+	}
+	return artifact, nil
+}
+func (a *APIServer) artifactUploads(w http.ResponseWriter, r *http.Request) {
+	t, _ := r.Context().Value(tokenContextKey{}).(*Token)
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/artifacts/uploads/"), "/"), "/")
+	if len(parts) == 1 && parts[0] == "begin" && r.Method == http.MethodPost {
+		var in struct {
+			TotalChunks int `json:"total_chunks"`
+		}
+		if json.NewDecoder(r.Body).Decode(&in) != nil {
+			jsonError(w, 400, "invalid JSON upload request", requestID(r))
+			return
+		}
+		out, e := a.beginArtifactUpload(t, in.TotalChunks)
+		if e != nil {
+			jsonError(w, 400, e.Error(), requestID(r))
+			return
+		}
+		jsonResponse(w, 201, map[string]any{"upload_id": out.ID, "max_chunk_bytes": maxArtifactChunk, "expires_at": out.ExpiresAt})
+		return
+	}
+	if len(parts) == 2 && r.Method == http.MethodPost {
+		if parts[1] == "chunk" {
+			var in struct {
+				Index      int    `json:"index"`
+				DataBase64 string `json:"data_base64"`
+			}
+			d := json.NewDecoder(r.Body)
+			d.DisallowUnknownFields()
+			if d.Decode(&in) != nil || len(in.DataBase64) > base64.StdEncoding.EncodedLen(maxArtifactChunk) {
+				jsonError(w, 400, "invalid upload chunk", requestID(r))
+				return
+			}
+			data, e := base64.StdEncoding.DecodeString(in.DataBase64)
+			if e != nil {
+				jsonError(w, 400, "invalid base64 chunk", requestID(r))
+				return
+			}
+			out, e := a.appendArtifactChunk(t, parts[0], in.Index, data)
+			if e != nil {
+				jsonError(w, 400, e.Error(), requestID(r))
+				return
+			}
+			jsonResponse(w, 200, map[string]any{"upload_id": out.ID, "next_chunk": out.NextChunk, "size": out.Size})
+			return
+		}
+		if parts[1] == "complete" {
+			out, e := a.completeArtifactUpload(t, parts[0])
+			if e != nil {
+				jsonError(w, 400, e.Error(), requestID(r))
+				return
+			}
+			jsonResponse(w, 201, map[string]any{"id": out.ID, "sha256": out.SHA256, "size": out.Size, "expires_at": out.ExpiresAt})
+			return
+		}
+	}
+	jsonError(w, 404, "artifact upload endpoint not found", requestID(r))
 }
 
 func (a *APIServer) siteLogs(w http.ResponseWriter, r *http.Request) {
@@ -476,7 +682,7 @@ func (a *APIServer) siteOperations(w http.ResponseWriter, r *http.Request, parts
 		err = CallTypedHelper(r.Context(), a.Config, HelperRequest{TLS: &TLSRequest{Domain: domain}}, &value)
 		out = value
 	case "deployments":
-		if r.Method != http.MethodPost || len(parts) != 2 {
+		if r.Method != http.MethodPost || (len(parts) != 2 && !(len(parts) == 3 && parts[2] == "root")) {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
@@ -489,7 +695,12 @@ func (a *APIServer) siteOperations(w http.ResponseWriter, r *http.Request, parts
 		}
 		in.Domain = domain
 		in.OwnerTokenID = t.ID
-		action = "file.deploy_artifact"
+		in.Root = len(parts) == 3
+		if in.Root {
+			action = "file.deploy_root"
+		} else {
+			action = "file.deploy_artifact"
+		}
 		value := DeploymentResult{}
 		err = CallTypedHelper(r.Context(), a.Config, HelperRequest{Deploy: &in}, &value)
 		out = value
@@ -700,6 +911,10 @@ func (a *APIServer) openapi(w http.ResponseWriter, r *http.Request) {
 		"/v1/sites/{domain}/pagespeed/purge":                    map[string]any{"post": map[string]any{"summary": "Purge the validated per-site PageSpeed cache", "responses": response(map[string]any{"type": "object"})}},
 		"/v1/sites/{domain}/tls":                                map[string]any{"get": map[string]any{"summary": "Read certificate details and expiry-based renewal health (tls:read)", "responses": response(map[string]any{"$ref": "#/components/schemas/TLSDetails"})}},
 		"/v1/sites/{domain}/deployments":                        map[string]any{"post": map[string]any{"summary": "Deploy a managed ZIP artifact (files:write plus file.deploy_artifact policy)", "responses": response(map[string]any{"$ref": "#/components/schemas/Deployment"})}},
+		"/v1/sites/{domain}/deployments/root":                   map[string]any{"post": map[string]any{"summary": "Replace active root after a mandatory safety backup (files:write, file.deploy_root policy, replace=true, confirm=true)", "responses": response(map[string]any{"$ref": "#/components/schemas/Deployment"})}},
+		"/v1/artifacts/uploads/begin":                           map[string]any{"post": map[string]any{"summary": "Begin a bounded token-owned chunked upload", "responses": response(map[string]any{"type": "object"})}},
+		"/v1/artifacts/uploads/{upload_id}/chunk":               map[string]any{"post": map[string]any{"summary": "Store one sequential base64 chunk", "responses": response(map[string]any{"type": "object"})}},
+		"/v1/artifacts/uploads/{upload_id}/complete":            map[string]any{"post": map[string]any{"summary": "Validate and finalize a ZIP artifact upload", "responses": response(map[string]any{"$ref": "#/components/schemas/Artifact"})}},
 		"/v1/sites/{domain}/backups":                            map[string]any{"get": map[string]any{"summary": "List managed encrypted backups (backups:read)", "responses": response(map[string]any{"type": "object"})}, "post": map[string]any{"summary": "Create a managed encrypted backup (backups:write)", "responses": response(map[string]any{"$ref": "#/components/schemas/BackupResult"})}},
 		"/v1/sites/{domain}/backups/{backup_id}/restore":        map[string]any{"post": map[string]any{"summary": "Restore selected components with confirm=true (backups:write plus backup.restore policy)", "responses": response(map[string]any{"$ref": "#/components/schemas/BackupResult"})}},
 		"/mcp": map[string]any{"post": map[string]string{"summary": "MCP Streamable HTTP endpoint"}},
@@ -713,6 +928,7 @@ func (a *APIServer) openapi(w http.ResponseWriter, r *http.Request) {
 		"PasswordRotation": map[string]any{"type": "object", "properties": map[string]any{"site_user": map[string]string{"type": "string"}, "password": map[string]string{"type": "string", "writeOnly": "true"}}},
 		"TLSDetails":       map[string]any{"type": "object", "properties": map[string]any{"issuer": map[string]string{"type": "string"}, "subject": map[string]string{"type": "string"}, "expires_at": map[string]string{"type": "string", "format": "date-time"}, "sans": map[string]any{"type": "array", "items": map[string]string{"type": "string"}}, "renewal_health": map[string]string{"type": "string"}}},
 		"Deployment":       map[string]any{"type": "object", "properties": map[string]any{"artifact_id": map[string]string{"type": "string"}, "sha256": map[string]string{"type": "string"}, "target_dir": map[string]string{"type": "string"}, "files": map[string]string{"type": "integer"}}},
+		"Artifact":         map[string]any{"type": "object", "properties": map[string]any{"id": map[string]string{"type": "string"}, "sha256": map[string]string{"type": "string"}, "size": map[string]string{"type": "integer"}, "expires_at": map[string]string{"type": "string", "format": "date-time"}}},
 		"BackupResult":     map[string]any{"type": "object", "properties": map[string]any{"backup": map[string]any{"type": "object"}, "retention": map[string]any{"type": "object"}, "safety_backup_id": map[string]string{"type": "string"}}},
 	}}})
 }
@@ -867,6 +1083,56 @@ func (a *APIServer) newMCP(t *Token) *mcp.Server {
 			return mcpToolError(err), DeploymentResult{}, nil
 		}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "artifact deployed"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "site_deploy_root_artifact", Description: "Replace a site's active document root from a managed ZIP artifact. It first creates an encrypted files safety backup, then performs an atomic directory swap. Requires files:write, local file.deploy_root policy, replace=true, and confirm=true."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpRootDeployInput) (*mcp.CallToolResult, DeploymentResult, error) {
+		if !HasScope(t, "files:write") {
+			return mcpScopeError(), DeploymentResult{}, nil
+		}
+		out := DeploymentResult{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Deploy: &DeployRequest{Domain: in.Domain, ArtifactID: in.ArtifactID, Replace: in.Replace, Confirm: in.Confirm, Root: true, OwnerTokenID: t.ID}}, &out)
+		a.auditMCP(t, "file.deploy_root", start, err)
+		if err != nil {
+			return mcpToolError(err), DeploymentResult{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "site root deployed after safety backup"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "artifact_begin_upload", Description: "Begin a managed ZIP artifact upload. Supply the exact total number of base64 chunks (1-100), then use artifact_upload_chunk in order and artifact_complete_upload. Requires artifacts:write."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpArtifactBeginInput) (*mcp.CallToolResult, map[string]any, error) {
+		if !HasScope(t, "artifacts:write") {
+			return mcpScopeError(), nil, nil
+		}
+		out, e := a.beginArtifactUpload(t, in.TotalChunks)
+		if e != nil {
+			return mcpToolError(e), nil, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "artifact upload session created"}}}, map[string]any{"upload_id": out.ID, "max_chunk_bytes": maxArtifactChunk, "expires_at": out.ExpiresAt}, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "artifact_upload_chunk", Description: "Upload one sequential base64 ZIP chunk to a managed artifact session. Each decoded chunk is at most 1 MiB. Requires artifacts:write."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpArtifactChunkInput) (*mcp.CallToolResult, map[string]any, error) {
+		if !HasScope(t, "artifacts:write") {
+			return mcpScopeError(), nil, nil
+		}
+		if len(in.DataBase64) > base64.StdEncoding.EncodedLen(maxArtifactChunk) {
+			return mcpToolError(errors.New("base64 chunk exceeds 1 MiB decoded limit")), nil, nil
+		}
+		data, e := base64.StdEncoding.DecodeString(in.DataBase64)
+		if e != nil {
+			return mcpToolError(errors.New("invalid base64 chunk")), nil, nil
+		}
+		out, e := a.appendArtifactChunk(t, in.UploadID, in.Index, data)
+		if e != nil {
+			return mcpToolError(e), nil, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "artifact chunk stored"}}}, map[string]any{"upload_id": out.ID, "next_chunk": out.NextChunk, "size": out.Size}, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "artifact_complete_upload", Description: "Validate a completed managed ZIP upload, calculate its SHA-256 digest, and return the artifact_id for deployment. Requires artifacts:write."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpArtifactCompleteInput) (*mcp.CallToolResult, Artifact, error) {
+		if !HasScope(t, "artifacts:write") {
+			return mcpScopeError(), Artifact{}, nil
+		}
+		out, e := a.completeArtifactUpload(t, in.UploadID)
+		if e != nil {
+			return mcpToolError(e), Artifact{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "artifact upload completed"}}}, out, nil
 	})
 	mcp.AddTool(s, &mcp.Tool{Name: "site_backup_create", Description: "Create an encrypted, local managed backup of files, databases, or both. Database selection is derived from the CloudPanel site relation. Requires backups:write."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpBackupCreateInput) (*mcp.CallToolResult, BackupResult, error) {
 		if !HasScope(t, "backups:write") {

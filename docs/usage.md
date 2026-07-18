@@ -59,6 +59,7 @@ The following actions are disabled by default even for an `admin` token:
 - vhost-template writes and imports; and
 - system permission reset.
 - managed ZIP artifact deployment; and
+- active site-root artifact deployment; and
 - backup restore.
 
 Review and enable an operation only when required:
@@ -112,6 +113,9 @@ sudo cloudpanel-gateway tls status --domain app.example.com
 sudo cloudpanel-gateway policy enable --operation file.deploy_artifact
 sudo cloudpanel-gateway file deploy-artifact --domain app.example.com \
   --artifact-id artifact_example --target-dir releases/current
+sudo cloudpanel-gateway policy enable --operation file.deploy_root
+sudo cloudpanel-gateway file deploy-root-artifact --domain app.example.com \
+  --artifact-id artifact_example --replace --confirm
 sudo cloudpanel-gateway backup create --domain app.example.com --components both
 sudo cloudpanel-gateway backup list --domain app.example.com
 sudo cloudpanel-gateway policy enable --operation backup.restore
@@ -123,6 +127,12 @@ Artifact deployment is ZIP-only and target containment is enforced. A non-empty
 target additionally requires `--replace --confirm`. Backups are root-owned,
 encrypted managed recovery objects; no archive is downloadable over REST or
 MCP. Retention is seven days and 10 GiB in total.
+
+For MCP clients, use `artifact_begin_upload`, sequential
+`artifact_upload_chunk` calls (base64 decoded size up to 1 MiB each), then
+`artifact_complete_upload` to receive an artifact ID. Root deployment is a
+separate `site_deploy_root_artifact` action that always creates a files safety
+backup before its atomic swap.
 
 ## Site log investigation
 

@@ -23,8 +23,8 @@ or `clpctl` execution to the network.
 - Read-only site log investigation and deterministic diagnostics for Nginx,
   PHP, rotated logs, and common framework application logs.
 - Revision-guarded site-root, PHP, PageSpeed, and site-user password controls.
-- Read-only TLS inspection plus policy-gated ZIP artifact deployments and
-  encrypted local site backups with a mandatory pre-restore safety backup.
+- Read-only TLS inspection plus MCP chunked ZIP uploads, policy-gated
+  deployments, and encrypted local site backups with safety backups.
 
 ## Quick start
 
@@ -98,7 +98,7 @@ enabled. Read [the security model](docs/security.md) before production use.
 | CloudPanel | Basic auth and release channel controls; Cloudflare IP updates; Varnish purge; vhost-template management. |
 | Site settings | Site facts/TLS/drift, guarded root directory update, one-time site-user password rotation, safe PHP limits/directives, and PageSpeed controls. |
 | Logs | Source discovery, bounded queries, redaction, gzip rotation support, and deterministic diagnosis signals. |
-| Recovery | TLS health inspection, managed ZIP deployment, and encrypted files/databases backups retained locally for seven days (10 GiB total). |
+| Recovery | TLS health inspection, MCP-managed ZIP upload/deployment, and encrypted files/databases backups retained locally for seven days (10 GiB total). |
 
 The exact request schema is published by the running gateway at `/openapi.json`.
 The MCP server describes its typed tools during tool discovery.

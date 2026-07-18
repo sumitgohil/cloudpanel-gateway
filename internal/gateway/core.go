@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS policy (operation TEXT PRIMARY KEY, enabled INTEGER N
 CREATE TABLE IF NOT EXISTS domains (domain TEXT PRIMARY KEY, site_user TEXT NOT NULL, secret BLOB NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT, token_id TEXT, action TEXT NOT NULL, outcome TEXT NOT NULL, detail TEXT, duration_ms INTEGER, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS artifacts (id TEXT PRIMARY KEY, path TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL, owner_token_id TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS artifact_uploads (id TEXT PRIMARY KEY, path TEXT NOT NULL, owner_token_id TEXT NOT NULL, size INTEGER NOT NULL, next_chunk INTEGER NOT NULL, total_chunks INTEGER NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS backups (id TEXT PRIMARY KEY, domain TEXT NOT NULL, components TEXT NOT NULL, databases TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, encrypted_size INTEGER NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, safety_backup_of TEXT);`)
 	if err != nil {
 		db.Close()

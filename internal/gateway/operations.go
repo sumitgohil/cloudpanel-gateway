@@ -32,14 +32,16 @@ import (
 )
 
 const (
-	artifactTTL            = time.Hour
-	backupTTL              = 7 * 24 * time.Hour
-	backupQuota      int64 = 10 << 30
-	maxZIPCompressed int64 = 100 << 20
-	maxZIPExpanded   int64 = 512 << 20
-	maxZIPEntries          = 10000
-	maxZIPRatio      int64 = 100
-	backupChunk            = 4 << 20
+	artifactTTL             = time.Hour
+	backupTTL               = 7 * 24 * time.Hour
+	backupQuota       int64 = 10 << 30
+	maxZIPCompressed  int64 = 100 << 20
+	maxZIPExpanded    int64 = 512 << 20
+	maxZIPEntries           = 10000
+	maxZIPRatio       int64 = 100
+	backupChunk             = 4 << 20
+	maxArtifactChunk        = 1 << 20
+	maxArtifactChunks       = 100
 )
 
 type Artifact struct {
@@ -48,6 +50,16 @@ type Artifact struct {
 	SHA256       string    `json:"sha256"`
 	Size         int64     `json:"size"`
 	OwnerTokenID string    `json:"owner_token_id"`
+	CreatedAt    time.Time `json:"created_at"`
+	ExpiresAt    time.Time `json:"expires_at"`
+}
+type ArtifactUpload struct {
+	ID           string    `json:"upload_id"`
+	Path         string    `json:"-"`
+	OwnerTokenID string    `json:"-"`
+	Size         int64     `json:"size"`
+	NextChunk    int       `json:"next_chunk"`
+	TotalChunks  int       `json:"total_chunks"`
 	CreatedAt    time.Time `json:"created_at"`
 	ExpiresAt    time.Time `json:"expires_at"`
 }
@@ -74,14 +86,16 @@ type DeployRequest struct {
 	Replace      bool   `json:"replace"`
 	Confirm      bool   `json:"confirm"`
 	OwnerTokenID string `json:"owner_token_id"`
+	Root         bool   `json:"root"`
 }
 type DeploymentResult struct {
-	Domain     string `json:"domain"`
-	ArtifactID string `json:"artifact_id"`
-	Digest     string `json:"sha256"`
-	TargetDir  string `json:"target_dir"`
-	Files      int    `json:"files"`
-	Replaced   bool   `json:"replaced"`
+	Domain         string `json:"domain"`
+	ArtifactID     string `json:"artifact_id"`
+	Digest         string `json:"sha256"`
+	TargetDir      string `json:"target_dir"`
+	Files          int    `json:"files"`
+	Replaced       bool   `json:"replaced"`
+	SafetyBackupID string `json:"safety_backup_id,omitempty"`
 }
 type BackupRequest struct {
 	Operation  string `json:"operation"`
@@ -155,7 +169,50 @@ func (s *State) CleanupArtifacts(now time.Time) error {
 		_ = os.Remove(p)
 	}
 	_, e = s.DB.Exec(`DELETE FROM artifacts WHERE expires_at<=?`, now.UTC().Format(time.RFC3339))
+	if e != nil {
+		return e
+	}
+	rows, e = s.DB.Query(`SELECT path FROM artifact_uploads WHERE expires_at<=?`, now.UTC().Format(time.RFC3339))
+	if e != nil {
+		return e
+	}
+	defer rows.Close()
+	paths = paths[:0]
+	for rows.Next() {
+		var p string
+		if rows.Scan(&p) == nil {
+			paths = append(paths, p)
+		}
+	}
+	for _, p := range paths {
+		_ = os.Remove(p)
+	}
+	_, e = s.DB.Exec(`DELETE FROM artifact_uploads WHERE expires_at<=?`, now.UTC().Format(time.RFC3339))
 	return e
+}
+
+func (s *State) PutArtifactUpload(u ArtifactUpload) error {
+	_, err := s.DB.Exec(`INSERT INTO artifact_uploads(id,path,owner_token_id,size,next_chunk,total_chunks,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)`, u.ID, u.Path, u.OwnerTokenID, u.Size, u.NextChunk, u.TotalChunks, u.CreatedAt.UTC().Format(time.RFC3339), u.ExpiresAt.UTC().Format(time.RFC3339))
+	return err
+}
+func (s *State) ArtifactUpload(id string) (ArtifactUpload, error) {
+	var u ArtifactUpload
+	var created, expires string
+	err := s.DB.QueryRow(`SELECT id,path,owner_token_id,size,next_chunk,total_chunks,created_at,expires_at FROM artifact_uploads WHERE id=?`, id).Scan(&u.ID, &u.Path, &u.OwnerTokenID, &u.Size, &u.NextChunk, &u.TotalChunks, &created, &expires)
+	if err != nil {
+		return u, err
+	}
+	u.CreatedAt, _ = time.Parse(time.RFC3339, created)
+	u.ExpiresAt, _ = time.Parse(time.RFC3339, expires)
+	return u, nil
+}
+func (s *State) AdvanceArtifactUpload(id string, size int64, next int) error {
+	_, err := s.DB.Exec(`UPDATE artifact_uploads SET size=?,next_chunk=? WHERE id=?`, size, next, id)
+	return err
+}
+func (s *State) DeleteArtifactUpload(id string) error {
+	_, err := s.DB.Exec(`DELETE FROM artifact_uploads WHERE id=?`, id)
+	return err
 }
 func (s *State) PutBackup(b Backup) error {
 	dbs, _ := json.Marshal(b.Databases)
@@ -311,10 +368,14 @@ func deployArtifact(ctx context.Context, c Config, s *State, r DeployRequest) (D
 	if r.ArtifactID == "" || len(r.ArtifactID) > 100 {
 		return DeploymentResult{}, errors.New("invalid artifact ID")
 	}
-	if r.TargetDir == "" {
+	if !r.Root && r.TargetDir == "" {
 		return DeploymentResult{}, errors.New("target_dir is required")
 	}
-	allowed, e := s.Allowed("file.deploy_artifact")
+	policy := "file.deploy_artifact"
+	if r.Root {
+		policy = "file.deploy_root"
+	}
+	allowed, e := s.Allowed(policy)
 	if e != nil || !allowed {
 		return DeploymentResult{}, errors.New("operation disabled by server policy")
 	}
@@ -333,9 +394,15 @@ func deployArtifact(ctx context.Context, c Config, s *State, r DeployRequest) (D
 	if e != nil {
 		return DeploymentResult{}, e
 	}
-	target, e := containedTarget(l.root, r.TargetDir, true)
-	if e != nil {
-		return DeploymentResult{}, e
+	target := l.root
+	if !r.Root {
+		var targetErr error
+		target, targetErr = containedTarget(l.root, r.TargetDir, true)
+		if targetErr != nil {
+			return DeploymentResult{}, targetErr
+		}
+	} else if !r.Replace || !r.Confirm {
+		return DeploymentResult{}, errors.New("root deployment requires replace=true and confirm=true")
 	}
 	info, e := os.Stat(target)
 	exists := e == nil
@@ -347,6 +414,14 @@ func deployArtifact(ctx context.Context, c Config, s *State, r DeployRequest) (D
 	}
 	if exists && (!r.Replace || !r.Confirm) {
 		return DeploymentResult{}, errors.New("existing target requires replace=true and confirm=true")
+	}
+	var safetyID string
+	if r.Root {
+		safety, backupErr := createBackup(ctx, c, s, r.Domain, "files", "")
+		if backupErr != nil {
+			return DeploymentResult{}, fmt.Errorf("pre-deployment safety backup failed: %w", backupErr)
+		}
+		safetyID = safety.Backup.ID
 	}
 	stage := filepath.Join(filepath.Dir(target), ".cpgw-stage-"+filepath.Base(target)+"-"+randomArtifactID())
 	if e = os.Mkdir(stage, 0700); e != nil {
@@ -379,7 +454,10 @@ func deployArtifact(ctx context.Context, c Config, s *State, r DeployRequest) (D
 	if old != "" {
 		_ = os.RemoveAll(old)
 	}
-	return DeploymentResult{Domain: r.Domain, ArtifactID: a.ID, Digest: a.SHA256, TargetDir: r.TargetDir, Files: count, Replaced: exists}, nil
+	if r.Root {
+		r.TargetDir = "/"
+	}
+	return DeploymentResult{Domain: r.Domain, ArtifactID: a.ID, Digest: a.SHA256, TargetDir: r.TargetDir, Files: count, Replaced: exists, SafetyBackupID: safetyID}, nil
 }
 func containedTarget(root, rel string, mustExistParent bool) (string, error) {
 	if filepath.IsAbs(rel) || strings.Contains(rel, "\\") {
@@ -474,6 +552,45 @@ func extractZIP(path, dest string) (int, error) {
 		count++
 	}
 	return count, nil
+}
+
+func validateArtifactZIP(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if st.Size() < 4 || st.Size() > maxZIPCompressed {
+		return errors.New("ZIP exceeds permitted size")
+	}
+	z, err := zip.NewReader(f, st.Size())
+	if err != nil {
+		return errors.New("artifact must be a valid ZIP")
+	}
+	if len(z.File) == 0 || len(z.File) > maxZIPEntries {
+		return errors.New("ZIP has invalid entry count")
+	}
+	seen := map[string]bool{}
+	var total int64
+	for _, entry := range z.File {
+		name := filepath.Clean(entry.Name)
+		if name == "." || filepath.IsAbs(entry.Name) || strings.HasPrefix(name, ".."+string(os.PathSeparator)) || seen[name] {
+			return errors.New("ZIP contains unsafe or duplicate path")
+		}
+		seen[name] = true
+		if entry.FileInfo().Mode()&os.ModeSymlink != 0 || (!entry.FileInfo().IsDir() && !entry.FileInfo().Mode().IsRegular()) {
+			return errors.New("ZIP contains unsupported file type")
+		}
+		total += int64(entry.UncompressedSize64)
+		if total > maxZIPExpanded || (entry.CompressedSize64 > 0 && int64(entry.UncompressedSize64) > int64(entry.CompressedSize64)*maxZIPRatio) {
+			return errors.New("ZIP expansion limit exceeded")
+		}
+	}
+	return nil
 }
 func uidFor(name string) int {
 	u, e := userLookup(name)
