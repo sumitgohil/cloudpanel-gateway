@@ -71,6 +71,7 @@ EOF
   chmod 0644 /etc/cloudpanel-gateway/config.json
 fi
 install -m 0644 "$(dirname "$0")/deploy/systemd/cloudpanel-gateway-helper.service" /etc/systemd/system/cloudpanel-gateway-helper.service
+install -m 0644 "$(dirname "$0")/deploy/systemd/cloudpanel-gateway-nginx-commit.service" /etc/systemd/system/cloudpanel-gateway-nginx-commit.service
 install -m 0644 "$(dirname "$0")/deploy/systemd/cloudpanel-gateway.service" /etc/systemd/system/cloudpanel-gateway.service
 if [[ ! -f /var/lib/cloudpanel-gateway/state.db ]]; then
   /usr/local/bin/cloudpanel-gateway --config /etc/cloudpanel-gateway/config.json bootstrap
@@ -79,6 +80,6 @@ chown cloudpanel-gateway:cloudpanel-gateway /var/lib/cloudpanel-gateway/state.db
 chown root:cloudpanel-gateway /var/lib/cloudpanel-gateway/token-pepper
 chmod 0640 /var/lib/cloudpanel-gateway/token-pepper
 systemctl daemon-reload
-systemctl enable --now cloudpanel-gateway-helper.service cloudpanel-gateway.service
+systemctl enable --now cloudpanel-gateway-nginx-commit.service cloudpanel-gateway-helper.service cloudpanel-gateway.service
 curl --fail --silent --show-error http://127.0.0.1:9780/readyz >/dev/null
 echo "Installed CloudPanel Gateway. Read the one-time bootstrap token in /root/cloudpanel-gateway-bootstrap-token.txt."

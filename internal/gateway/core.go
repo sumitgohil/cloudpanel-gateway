@@ -27,17 +27,19 @@ import (
 const ProtocolVersion = 1
 
 type Config struct {
-	Listen       string   `json:"listen"`
-	HelperSocket string   `json:"helper_socket"`
-	Database     string   `json:"database"`
-	ArtifactDir  string   `json:"artifact_dir"`
-	SecretFile   string   `json:"secret_file"`
-	HelperGID    int      `json:"helper_gid"`
-	AllowedHosts []string `json:"allowed_hosts"`
+	Listen             string   `json:"listen"`
+	HelperSocket       string   `json:"helper_socket"`
+	NginxCommitSocket  string   `json:"nginx_commit_socket"`
+	Database           string   `json:"database"`
+	CloudPanelDatabase string   `json:"cloudpanel_database"`
+	ArtifactDir        string   `json:"artifact_dir"`
+	SecretFile         string   `json:"secret_file"`
+	HelperGID          int      `json:"helper_gid"`
+	AllowedHosts       []string `json:"allowed_hosts"`
 }
 
 func DefaultConfig() Config {
-	return Config{Listen: "127.0.0.1:9780", HelperSocket: "/run/cloudpanel-gateway/helper.sock", Database: "/var/lib/cloudpanel-gateway/state.db", ArtifactDir: "/var/lib/cloudpanel-gateway/artifacts", SecretFile: "/var/lib/cloudpanel-gateway/token-pepper"}
+	return Config{Listen: "127.0.0.1:9780", HelperSocket: "/run/cloudpanel-gateway/helper.sock", NginxCommitSocket: "/run/cloudpanel-gateway/nginx-commit.sock", Database: "/var/lib/cloudpanel-gateway/state.db", CloudPanelDatabase: "/home/clp/htdocs/app/data/db.sq3", ArtifactDir: "/var/lib/cloudpanel-gateway/artifacts", SecretFile: "/var/lib/cloudpanel-gateway/token-pepper"}
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -54,7 +56,7 @@ func LoadConfig(path string) (Config, error) {
 	for _, item := range []struct {
 		key string
 		dst *string
-	}{{"CPG_LISTEN", &c.Listen}, {"CPG_HELPER_SOCKET", &c.HelperSocket}, {"CPG_DATABASE", &c.Database}, {"CPG_ARTIFACT_DIR", &c.ArtifactDir}, {"CPG_SECRET_FILE", &c.SecretFile}} {
+	}{{"CPG_LISTEN", &c.Listen}, {"CPG_HELPER_SOCKET", &c.HelperSocket}, {"CPG_NGINX_COMMIT_SOCKET", &c.NginxCommitSocket}, {"CPG_DATABASE", &c.Database}, {"CPG_CLOUDPANEL_DATABASE", &c.CloudPanelDatabase}, {"CPG_ARTIFACT_DIR", &c.ArtifactDir}, {"CPG_SECRET_FILE", &c.SecretFile}} {
 		if v := os.Getenv(item.key); v != "" {
 			*item.dst = v
 		}
@@ -411,10 +413,11 @@ func safeArtifactPath(path, base string) bool {
 }
 
 type HelperRequest struct {
-	Version int               `json:"version"`
-	Action  string            `json:"action"`
-	Args    map[string]string `json:"args"`
-	Log     *LogRequest       `json:"log,omitempty"`
+	Version  int               `json:"version"`
+	Action   string            `json:"action"`
+	Args     map[string]string `json:"args"`
+	Log      *LogRequest       `json:"log,omitempty"`
+	Settings *SettingsRequest  `json:"settings,omitempty"`
 }
 type HelperResponse struct {
 	OK       bool            `json:"ok"`
@@ -445,6 +448,17 @@ func Execute(ctx context.Context, c Config, s *State, req HelperRequest) HelperR
 		data, err := json.Marshal(value)
 		if err != nil {
 			return HelperResponse{Error: "encode log result"}
+		}
+		return HelperResponse{OK: true, Data: data}
+	}
+	if req.Settings != nil {
+		value, err := executeSettings(ctx, c, s, *req.Settings)
+		if err != nil {
+			return HelperResponse{Error: err.Error()}
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			return HelperResponse{Error: "encode settings result"}
 		}
 		return HelperResponse{OK: true, Data: data}
 	}
@@ -593,4 +607,24 @@ func CallLogSourcesHelper(ctx context.Context, c Config, domain, appLogPath stri
 		return LogSourcesResult{}, e
 	}
 	return result, nil
+}
+
+func CallSettingsHelper(ctx context.Context, c Config, request SettingsRequest, out any) error {
+	d := net.Dialer{Timeout: 5 * time.Second}
+	conn, err := d.DialContext(ctx, "unix", c.HelperSocket)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err = json.NewEncoder(conn).Encode(HelperRequest{Version: ProtocolVersion, Settings: &request}); err != nil {
+		return err
+	}
+	var response HelperResponse
+	if err = json.NewDecoder(io.LimitReader(conn, 12<<20)).Decode(&response); err != nil {
+		return err
+	}
+	if !response.OK {
+		return errors.New(response.Error)
+	}
+	return json.Unmarshal(response.Data, out)
 }
