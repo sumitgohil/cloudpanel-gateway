@@ -36,13 +36,14 @@ type Config struct {
 	BackupDir          string   `json:"backup_dir"`
 	BackupKeyFile      string   `json:"backup_key_file"`
 	BuildDir           string   `json:"build_dir"`
+	CronDir            string   `json:"cron_dir"`
 	SecretFile         string   `json:"secret_file"`
 	HelperGID          int      `json:"helper_gid"`
 	AllowedHosts       []string `json:"allowed_hosts"`
 }
 
 func DefaultConfig() Config {
-	return Config{Listen: "127.0.0.1:9780", HelperSocket: "/run/cloudpanel-gateway/helper.sock", NginxCommitSocket: "/run/cloudpanel-gateway-nginx-commit/nginx-commit.sock", Database: "/var/lib/cloudpanel-gateway/state.db", CloudPanelDatabase: "/home/clp/htdocs/app/data/db.sq3", ArtifactDir: "/var/lib/cloudpanel-gateway/artifacts", BackupDir: "/var/lib/cloudpanel-gateway/backups", BackupKeyFile: "/var/lib/cloudpanel-gateway/backup-key", BuildDir: "/var/lib/cloudpanel-gateway/builds", SecretFile: "/var/lib/cloudpanel-gateway/token-pepper"}
+	return Config{Listen: "127.0.0.1:9780", HelperSocket: "/run/cloudpanel-gateway/helper.sock", NginxCommitSocket: "/run/cloudpanel-gateway-nginx-commit/nginx-commit.sock", Database: "/var/lib/cloudpanel-gateway/state.db", CloudPanelDatabase: "/home/clp/htdocs/app/data/db.sq3", ArtifactDir: "/var/lib/cloudpanel-gateway/artifacts", BackupDir: "/var/lib/cloudpanel-gateway/backups", BackupKeyFile: "/var/lib/cloudpanel-gateway/backup-key", BuildDir: "/var/lib/cloudpanel-gateway/builds", CronDir: "/etc/cron.d", SecretFile: "/var/lib/cloudpanel-gateway/token-pepper"}
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -59,7 +60,7 @@ func LoadConfig(path string) (Config, error) {
 	for _, item := range []struct {
 		key string
 		dst *string
-	}{{"CPG_LISTEN", &c.Listen}, {"CPG_HELPER_SOCKET", &c.HelperSocket}, {"CPG_NGINX_COMMIT_SOCKET", &c.NginxCommitSocket}, {"CPG_DATABASE", &c.Database}, {"CPG_CLOUDPANEL_DATABASE", &c.CloudPanelDatabase}, {"CPG_ARTIFACT_DIR", &c.ArtifactDir}, {"CPG_BACKUP_DIR", &c.BackupDir}, {"CPG_BACKUP_KEY_FILE", &c.BackupKeyFile}, {"CPG_BUILD_DIR", &c.BuildDir}, {"CPG_SECRET_FILE", &c.SecretFile}} {
+	}{{"CPG_LISTEN", &c.Listen}, {"CPG_HELPER_SOCKET", &c.HelperSocket}, {"CPG_NGINX_COMMIT_SOCKET", &c.NginxCommitSocket}, {"CPG_DATABASE", &c.Database}, {"CPG_CLOUDPANEL_DATABASE", &c.CloudPanelDatabase}, {"CPG_ARTIFACT_DIR", &c.ArtifactDir}, {"CPG_BACKUP_DIR", &c.BackupDir}, {"CPG_BACKUP_KEY_FILE", &c.BackupKeyFile}, {"CPG_BUILD_DIR", &c.BuildDir}, {"CPG_CRON_DIR", &c.CronDir}, {"CPG_SECRET_FILE", &c.SecretFile}} {
 		if v := os.Getenv(item.key); v != "" {
 			*item.dst = v
 		}
@@ -123,7 +124,8 @@ CREATE TABLE IF NOT EXISTS artifact_uploads (id TEXT PRIMARY KEY, path TEXT NOT 
 CREATE TABLE IF NOT EXISTS backups (id TEXT PRIMARY KEY, domain TEXT NOT NULL, components TEXT NOT NULL, databases TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, encrypted_size INTEGER NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, safety_backup_of TEXT);
 CREATE TABLE IF NOT EXISTS node_configs (domain TEXT PRIMARY KEY, unit_name TEXT NOT NULL, node_version TEXT NOT NULL, app_port INTEGER NOT NULL, entrypoint TEXT NOT NULL, args TEXT NOT NULL, health_path TEXT, active_release_id TEXT, previous_release_id TEXT, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS node_releases (id TEXT PRIMARY KEY, domain TEXT NOT NULL, artifact_id TEXT NOT NULL, sha256 TEXT NOT NULL, framework TEXT NOT NULL, entrypoint TEXT NOT NULL, path TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, activated_at TEXT);
-CREATE TABLE IF NOT EXISTS builds (id TEXT PRIMARY KEY, domain TEXT NOT NULL, source_artifact_id TEXT NOT NULL, mode TEXT NOT NULL, framework TEXT NOT NULL, output_artifact_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT);`)
+CREATE TABLE IF NOT EXISTS builds (id TEXT PRIMARY KEY, domain TEXT NOT NULL, source_artifact_id TEXT NOT NULL, mode TEXT NOT NULL, framework TEXT NOT NULL, output_artifact_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT);
+CREATE TABLE IF NOT EXISTS cron_metadata (job_id INTEGER PRIMARY KEY, domain TEXT NOT NULL, runner TEXT NOT NULL, target TEXT NOT NULL, updated_at TEXT NOT NULL);`)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -433,6 +435,7 @@ type HelperRequest struct {
 	Node     *NodeRequest      `json:"node,omitempty"`
 	Build    *BuildRequest     `json:"build,omitempty"`
 	Static   *StaticRequest    `json:"static,omitempty"`
+	Cron     *CronRequest      `json:"cron,omitempty"`
 }
 type HelperResponse struct {
 	OK       bool            `json:"ok"`
@@ -540,6 +543,17 @@ func Execute(ctx context.Context, c Config, s *State, req HelperRequest) HelperR
 		data, err := json.Marshal(value)
 		if err != nil {
 			return HelperResponse{Error: "encode static result"}
+		}
+		return HelperResponse{OK: true, Data: data}
+	}
+	if req.Cron != nil {
+		value, err := executeCron(ctx, c, s, *req.Cron)
+		if err != nil {
+			return HelperResponse{Error: err.Error()}
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			return HelperResponse{Error: "encode cron result"}
 		}
 		return HelperResponse{OK: true, Data: data}
 	}

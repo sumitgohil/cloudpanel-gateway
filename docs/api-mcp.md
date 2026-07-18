@@ -151,3 +151,13 @@ The REST equivalents are `POST /v1/projects/inspect`,
 `POST /v1/sites/{domain}/node/rollback`, and
 `GET|PATCH /v1/sites/{domain}/static` plus
 `POST /v1/sites/{domain}/static/deploy`.
+
+## Site cron jobs
+
+`cron_list`, `cron_create`, `cron_update`, and `cron_delete` manage
+CloudPanel's persisted site cron jobs. REST equivalents are
+`GET|POST /v1/sites/{domain}/cron-jobs` and
+`PATCH|DELETE /v1/sites/{domain}/cron-jobs/{job_id}`. Reads require
+`cron:read`; mutations require `cron:write` and the current revision. Deletion
+requires `confirm=true`. Typed runners are preferred; `raw_command` requires
+the root-only `cron.raw_command` policy and explicit confirmation.

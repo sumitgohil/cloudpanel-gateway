@@ -38,6 +38,7 @@ Use only the scopes a client needs:
 | `certificates:write` | Let's Encrypt and policy-gated manual certificate actions. |
 | `tls:read` | Read active certificate identity, expiry, SANs, and readiness health. |
 | `logs:read` | Redacted site log discovery, query, and diagnosis. |
+| `cron:read`, `cron:write` | List and manage CloudPanel-compatible site cron jobs. |
 | `files:write` | Deploy an owned managed ZIP artifact after local policy approval. |
 | `node:read`, `node:write`, `node:deploy`, `node:build` | Read, configure, activate, roll back, and policy-gated build Node.js/SSR releases. |
 | `backups:read`, `backups:write` | List and create/restore encrypted managed backups. |
@@ -64,6 +65,7 @@ The following actions are disabled by default even for an `admin` token:
 - Node.js/SSR release activation and rollback;
 - Node.js runtime updates/restarts; and
 - sandboxed server-side npm builds.
+- raw cron commands (`cron.raw_command`).
 
 Review and enable an operation only when required:
 
@@ -71,6 +73,22 @@ Review and enable an operation only when required:
 sudo cloudpanel-gateway policy list
 sudo cloudpanel-gateway policy enable --operation database.export
 sudo cloudpanel-gateway policy disable --operation database.export
+```
+
+## Site cron jobs
+
+Cron jobs are stored in CloudPanel and rendered to `/etc/cron.d/<site-user>`;
+they run as the site Linux user, not root. Use `cron list` to obtain the
+revision before creating, updating, or deleting a job. Typed runners support
+`php_script`, `node_script`, `site_executable`, and same-domain HTTPS
+`http_request` jobs. `raw_command` is disabled until a root administrator
+enables `cron.raw_command`, and each raw request requires `confirm=true`.
+
+```bash
+sudo cloudpanel-gateway cron list --domain wp1.psng.tech
+sudo cloudpanel-gateway cron create --domain wp1.psng.tech \
+  --if-match-revision rev_example --minute '*/5' --hour '*' --day '*' --month '*' --weekday '*' \
+  --runner php_script --target artisan --arg schedule:run
 ```
 
 ## Site settings

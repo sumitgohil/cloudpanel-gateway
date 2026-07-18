@@ -66,7 +66,7 @@ func NewRootCommand() *cobra.Command {
 		defer s.Close()
 		return ListenNginxCommit(cmd.Context(), c)
 	}})
-	root.AddCommand(bootstrapCmd(load), tokenCmd(load), policyCmd(load), domainCmd(load), settingsCmd(load), tlsCmd(load), fileCmd(load), backupCmd(load), nodeCmd(load), doctorCmd(load), serviceCmd(load), completionCmd(root))
+	root.AddCommand(bootstrapCmd(load), tokenCmd(load), policyCmd(load), domainCmd(load), settingsCmd(load), tlsCmd(load), fileCmd(load), backupCmd(load), cronCmd(load), nodeCmd(load), doctorCmd(load), serviceCmd(load), completionCmd(root))
 	root.AddCommand(&cobra.Command{Use: "version", Short: "Print version", Run: func(cmd *cobra.Command, args []string) { fmt.Fprintln(cmd.OutOrStdout(), Version) }})
 	return root
 }
@@ -220,7 +220,7 @@ func policyCmd(load stateLoader) *cobra.Command {
 				return e
 			}
 			spec, ok := Actions[op]
-			managed := op == "file.deploy_artifact" || op == "file.deploy_root" || op == "backup.restore" || op == "node.server_build" || op == "node.deploy_release" || op == "node.runtime_manage"
+			managed := op == "file.deploy_artifact" || op == "file.deploy_root" || op == "backup.restore" || op == "node.server_build" || op == "node.deploy_release" || op == "node.runtime_manage" || op == "cron.raw_command"
 			if !ok && !managed {
 				return errors.New("unknown operation")
 			}
@@ -254,7 +254,7 @@ func policyCmd(load stateLoader) *cobra.Command {
 				out[n] = v
 			}
 		}
-		for _, n := range []string{"file.deploy_artifact", "file.deploy_root", "backup.restore", "node.server_build", "node.deploy_release", "node.runtime_manage"} {
+		for _, n := range []string{"file.deploy_artifact", "file.deploy_root", "backup.restore", "node.server_build", "node.deploy_release", "node.runtime_manage", "cron.raw_command"} {
 			v, _ := s.Allowed(n)
 			out[n] = v
 		}
@@ -604,6 +604,56 @@ func backupCmd(load stateLoader) *cobra.Command {
 	_ = restore.MarkFlagRequired("backup-id")
 	_ = restore.MarkFlagRequired("components")
 	cmd.AddCommand(create, list, restore)
+	return cmd
+}
+
+func cronCmd(load stateLoader) *cobra.Command {
+	cmd := &cobra.Command{Use: "cron", Short: "Manage CloudPanel site cron jobs"}
+	var domain, revision, runner, target, method, url, raw string
+	var id int64
+	var minute, hour, day, month, weekday string
+	var args []string
+	var confirm bool
+	request := func(operation string) HelperRequest {
+		return HelperRequest{Cron: &CronRequest{Operation: operation, Domain: domain, JobID: id, Minute: minute, Hour: hour, Day: day, Month: month, Weekday: weekday, Runner: runner, Target: target, Args: args, Method: method, URL: url, RawCommand: raw, IfMatchRevision: revision, Confirm: confirm}}
+	}
+	list := &cobra.Command{Use: "list", Short: "List a site's CloudPanel-managed cron jobs and revision", RunE: func(c *cobra.Command, _ []string) error { return typedLocalCall(load, c, request(cronList)) }}
+	create := &cobra.Command{Use: "create", Short: "Create a typed or policy-gated raw site cron job", RunE: func(c *cobra.Command, _ []string) error { return typedLocalCall(load, c, request(cronCreate)) }}
+	update := &cobra.Command{Use: "update", Short: "Update a cron job using the current revision", RunE: func(c *cobra.Command, _ []string) error { return typedLocalCall(load, c, request(cronUpdate)) }}
+	deleteCmd := &cobra.Command{Use: "delete", Short: "Delete a cron job after explicit confirmation", RunE: func(c *cobra.Command, _ []string) error { return typedLocalCall(load, c, request(cronDelete)) }}
+	for _, c := range []*cobra.Command{list, create, update, deleteCmd} {
+		c.Flags().StringVar(&domain, "domain", "", "CloudPanel site domain")
+		_ = c.MarkFlagRequired("domain")
+	}
+	for _, c := range []*cobra.Command{create, update} {
+		c.Flags().StringVar(&minute, "minute", "", "cron minute field")
+		c.Flags().StringVar(&hour, "hour", "", "cron hour field")
+		c.Flags().StringVar(&day, "day", "", "cron day-of-month field")
+		c.Flags().StringVar(&month, "month", "", "cron month field")
+		c.Flags().StringVar(&weekday, "weekday", "", "cron weekday field")
+		c.Flags().StringVar(&runner, "runner", "", "php_script, node_script, site_executable, http_request, or raw_command")
+		c.Flags().StringVar(&target, "target", "", "site-root-relative script target")
+		c.Flags().StringSliceVar(&args, "arg", nil, "typed runner argument; repeatable")
+		c.Flags().StringVar(&method, "method", "GET", "HTTP runner method: GET or POST")
+		c.Flags().StringVar(&url, "url", "", "HTTPS URL for http_request runner")
+		c.Flags().StringVar(&raw, "raw-command", "", "single-line raw command; requires local cron.raw_command policy and --confirm")
+		for _, name := range []string{"minute", "hour", "day", "month", "weekday", "runner"} {
+			_ = c.MarkFlagRequired(name)
+		}
+	}
+	update.Flags().Int64Var(&id, "job-id", 0, "CloudPanel cron job ID")
+	update.Flags().StringVar(&revision, "if-match-revision", "", "revision from cron list")
+	_ = update.MarkFlagRequired("job-id")
+	_ = update.MarkFlagRequired("if-match-revision")
+	deleteCmd.Flags().Int64Var(&id, "job-id", 0, "CloudPanel cron job ID")
+	deleteCmd.Flags().StringVar(&revision, "if-match-revision", "", "revision from cron list")
+	deleteCmd.Flags().BoolVar(&confirm, "confirm", false, "confirm job deletion")
+	_ = deleteCmd.MarkFlagRequired("job-id")
+	_ = deleteCmd.MarkFlagRequired("if-match-revision")
+	create.Flags().StringVar(&revision, "if-match-revision", "", "revision from cron list")
+	create.Flags().BoolVar(&confirm, "confirm", false, "required only for raw_command")
+	_ = create.MarkFlagRequired("if-match-revision")
+	cmd.AddCommand(list, create, update, deleteCmd)
 	return cmd
 }
 

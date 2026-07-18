@@ -100,6 +100,7 @@ enabled. Read [the security model](docs/security.md) before production use.
 | Logs | Source discovery, bounded queries, redaction, gzip rotation support, and deterministic diagnosis signals. |
 | Recovery | TLS health inspection, MCP-managed ZIP upload/deployment, and encrypted files/databases backups retained locally for seven days (10 GiB total). |
 | Applications | Static/Vite/Astro releases, optional SPA fallback routing, and policy-gated Node.js/SSR releases managed by hardened per-site systemd units. |
+| Cron jobs | CloudPanel-compatible, site-scoped schedules with typed PHP, Node.js, executable, and same-domain HTTPS runners; raw commands remain locally policy-gated. |
 
 The exact request schema is published by the running gateway at `/openapi.json`.
 The MCP server describes its typed tools during tool discovery.

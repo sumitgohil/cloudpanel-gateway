@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -120,6 +121,23 @@ type mcpArtifactChunkInput struct {
 }
 type mcpArtifactCompleteInput struct {
 	UploadID string `json:"upload_id"`
+}
+type mcpCronInput struct {
+	Domain          string   `json:"domain"`
+	JobID           int64    `json:"job_id,omitempty"`
+	Minute          string   `json:"minute,omitempty"`
+	Hour            string   `json:"hour,omitempty"`
+	Day             string   `json:"day,omitempty"`
+	Month           string   `json:"month,omitempty"`
+	Weekday         string   `json:"weekday,omitempty"`
+	Runner          string   `json:"runner,omitempty"`
+	Target          string   `json:"target,omitempty"`
+	Args            []string `json:"args,omitempty"`
+	Method          string   `json:"method,omitempty"`
+	URL             string   `json:"url,omitempty"`
+	RawCommand      string   `json:"raw_command,omitempty"`
+	IfMatchRevision string   `json:"if_match_revision,omitempty"`
+	Confirm         bool     `json:"confirm,omitempty"`
 }
 type mcpNodeInput struct {
 	Domain          string   `json:"domain"`
@@ -783,6 +801,10 @@ func (a *APIServer) siteLogs(w http.ResponseWriter, r *http.Request) {
 		a.siteOperations(w, r, parts)
 		return
 	}
+	if len(parts) >= 2 && parts[1] == "cron-jobs" {
+		a.siteCron(w, r, parts)
+		return
+	}
 	if len(parts) >= 2 && (parts[1] == "node" || parts[1] == "builds") {
 		a.siteNode(w, r, parts)
 		return
@@ -971,6 +993,82 @@ func (a *APIServer) siteOperations(w http.ResponseWriter, r *http.Request, parts
 	jsonResponse(w, 200, out)
 }
 
+func (a *APIServer) siteCron(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) < 2 || parts[1] != "cron-jobs" || ValidateDomain(parts[0]) != nil {
+		jsonError(w, http.StatusNotFound, "cron endpoint not found", requestID(r))
+		return
+	}
+	t, _ := r.Context().Value(tokenContextKey{}).(*Token)
+	need := "cron:write"
+	if r.Method == http.MethodGet {
+		need = "cron:read"
+	}
+	if t == nil || !HasScope(t, need) {
+		a.denied.Add(1)
+		jsonError(w, http.StatusForbidden, "insufficient scope", requestID(r))
+		return
+	}
+	domain := parts[0]
+	request := CronRequest{Domain: domain}
+	switch {
+	case len(parts) == 2 && r.Method == http.MethodGet:
+		request.Operation = cronList
+	case len(parts) == 2 && r.Method == http.MethodPost:
+		request.Operation = cronCreate
+		if err := decodeCronRequest(r, &request); err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error(), requestID(r))
+			return
+		}
+	case len(parts) == 3 && r.Method == http.MethodPatch:
+		id, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || id < 1 {
+			jsonError(w, http.StatusNotFound, "cron job not found", requestID(r))
+			return
+		}
+		request.Operation, request.JobID = cronUpdate, id
+		if err := decodeCronRequest(r, &request); err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error(), requestID(r))
+			return
+		}
+	case len(parts) == 3 && r.Method == http.MethodDelete:
+		id, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || id < 1 {
+			jsonError(w, http.StatusNotFound, "cron job not found", requestID(r))
+			return
+		}
+		request.Operation, request.JobID = cronDelete, id
+		if err := decodeCronRequest(r, &request); err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error(), requestID(r))
+			return
+		}
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	start := time.Now()
+	out := CronResult{}
+	err := CallTypedHelper(r.Context(), a.Config, HelperRequest{Cron: &request}, &out)
+	auditAction := "cron." + request.Operation
+	if err != nil {
+		a.State.Audit(requestID(r), t.ID, auditAction, "error", "site cron operation failed", time.Since(start))
+		jsonError(w, http.StatusBadRequest, err.Error(), requestID(r))
+		return
+	}
+	a.State.Audit(requestID(r), t.ID, auditAction, "ok", "site cron operation completed", time.Since(start))
+	jsonResponse(w, http.StatusOK, out)
+}
+
+func decodeCronRequest(r *http.Request, out *CronRequest) error {
+	operation, domain, jobID := out.Operation, out.Domain, out.JobID
+	d := json.NewDecoder(r.Body)
+	d.DisallowUnknownFields()
+	if err := d.Decode(out); err != nil {
+		return errors.New("invalid JSON cron request")
+	}
+	out.Operation, out.Domain, out.JobID = operation, domain, jobID
+	return nil
+}
+
 func (a *APIServer) siteSettings(w http.ResponseWriter, r *http.Request, parts []string) {
 	if len(parts) < 2 || ValidateDomain(parts[0]) != nil {
 		jsonError(w, http.StatusNotFound, "settings endpoint not found", requestID(r))
@@ -1121,6 +1219,8 @@ func (a *APIServer) openapi(w http.ResponseWriter, r *http.Request) {
 		"/v1/sites/{domain}/php":                                map[string]any{"get": map[string]any{"summary": "Read safe PHP settings", "responses": response(map[string]any{"$ref": "#/components/schemas/PHPSettings"})}, "patch": map[string]any{"summary": "Update reviewed PHP settings", "responses": response(map[string]any{"$ref": "#/components/schemas/PHPSettings"})}},
 		"/v1/sites/{domain}/pagespeed":                          map[string]any{"get": map[string]any{"summary": "Read PageSpeed settings", "responses": response(map[string]any{"$ref": "#/components/schemas/PageSpeed"})}, "patch": map[string]any{"summary": "Update PageSpeed preset and filters", "responses": response(map[string]any{"$ref": "#/components/schemas/PageSpeed"})}},
 		"/v1/sites/{domain}/pagespeed/purge":                    map[string]any{"post": map[string]any{"summary": "Purge the validated per-site PageSpeed cache", "responses": response(map[string]any{"type": "object"})}},
+		"/v1/sites/{domain}/cron-jobs":                          map[string]any{"get": map[string]any{"summary": "List CloudPanel site cron jobs (cron:read)", "responses": response(map[string]any{"$ref": "#/components/schemas/CronResult"})}, "post": map[string]any{"summary": "Create a typed cron job (cron:write; raw commands require cron.raw_command policy)", "responses": response(map[string]any{"$ref": "#/components/schemas/CronResult"})}},
+		"/v1/sites/{domain}/cron-jobs/{job_id}":                 map[string]any{"patch": map[string]any{"summary": "Update a cron job with its current revision", "responses": response(map[string]any{"$ref": "#/components/schemas/CronResult"})}, "delete": map[string]any{"summary": "Delete a cron job with confirm=true", "responses": response(map[string]any{"$ref": "#/components/schemas/CronResult"})}},
 		"/v1/sites/{domain}/tls":                                map[string]any{"get": map[string]any{"summary": "Read certificate details and expiry-based renewal health (tls:read)", "responses": response(map[string]any{"$ref": "#/components/schemas/TLSDetails"})}},
 		"/v1/sites/{domain}/deployments":                        map[string]any{"post": map[string]any{"summary": "Deploy a managed ZIP artifact (files:write plus file.deploy_artifact policy)", "responses": response(map[string]any{"$ref": "#/components/schemas/Deployment"})}},
 		"/v1/sites/{domain}/deployments/root":                   map[string]any{"post": map[string]any{"summary": "Replace active root after a mandatory safety backup (files:write, file.deploy_root policy, replace=true, confirm=true)", "responses": response(map[string]any{"$ref": "#/components/schemas/Deployment"})}},
@@ -1146,6 +1246,8 @@ func (a *APIServer) openapi(w http.ResponseWriter, r *http.Request) {
 		"SiteSettings":      map[string]any{"type": "object", "properties": map[string]any{"domain": map[string]string{"type": "string"}, "type": map[string]string{"type": "string"}, "site_user": map[string]string{"type": "string"}, "root_directory": map[string]string{"type": "string"}, "revision": map[string]string{"type": "string"}}},
 		"PHPSettings":       map[string]any{"type": "object", "properties": map[string]any{"applicable": map[string]string{"type": "boolean"}, "php_version": map[string]string{"type": "string"}, "values": map[string]any{"type": "object", "additionalProperties": map[string]string{"type": "string"}}, "revision": map[string]string{"type": "string"}}},
 		"PageSpeed":         map[string]any{"type": "object", "properties": map[string]any{"available": map[string]string{"type": "boolean"}, "enabled": map[string]string{"type": "boolean"}, "preset": map[string]string{"type": "string"}, "revision": map[string]string{"type": "string"}}},
+		"CronResult":        map[string]any{"type": "object", "properties": map[string]any{"domain": map[string]string{"type": "string"}, "revision": map[string]string{"type": "string"}, "jobs": map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/CronJob"}}}},
+		"CronJob":           map[string]any{"type": "object", "properties": map[string]any{"id": map[string]string{"type": "integer"}, "minute": map[string]string{"type": "string"}, "hour": map[string]string{"type": "string"}, "day": map[string]string{"type": "string"}, "month": map[string]string{"type": "string"}, "weekday": map[string]string{"type": "string"}, "runner": map[string]string{"type": "string"}, "target": map[string]string{"type": "string"}, "command": map[string]string{"type": "string"}}},
 		"PasswordRotation":  map[string]any{"type": "object", "properties": map[string]any{"site_user": map[string]string{"type": "string"}, "password": map[string]string{"type": "string", "writeOnly": "true"}}},
 		"TLSDetails":        map[string]any{"type": "object", "properties": map[string]any{"issuer": map[string]string{"type": "string"}, "subject": map[string]string{"type": "string"}, "expires_at": map[string]string{"type": "string", "format": "date-time"}, "sans": map[string]any{"type": "array", "items": map[string]string{"type": "string"}}, "renewal_health": map[string]string{"type": "string"}}},
 		"Deployment":        map[string]any{"type": "object", "properties": map[string]any{"artifact_id": map[string]string{"type": "string"}, "sha256": map[string]string{"type": "string"}, "target_dir": map[string]string{"type": "string"}, "files": map[string]string{"type": "integer"}}},
@@ -1283,6 +1385,32 @@ func (a *APIServer) newMCP(t *Token) *mcp.Server {
 		out := map[string]any{}
 		res, err := settingsCall(ctx, settingsPurgePS, "cache:purge", SettingsRequest{Domain: in.Domain}, &out)
 		return res, out, err
+	})
+	cronCall := func(ctx context.Context, scope, operation string, in mcpCronInput) (*mcp.CallToolResult, CronResult, error) {
+		if !HasScope(t, scope) {
+			return mcpScopeError(), CronResult{}, nil
+		}
+		out := CronResult{}
+		request := CronRequest{Operation: operation, Domain: in.Domain, JobID: in.JobID, Minute: in.Minute, Hour: in.Hour, Day: in.Day, Month: in.Month, Weekday: in.Weekday, Runner: in.Runner, Target: in.Target, Args: in.Args, Method: in.Method, URL: in.URL, RawCommand: in.RawCommand, IfMatchRevision: in.IfMatchRevision, Confirm: in.Confirm}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Cron: &request}, &out)
+		a.auditMCP(t, "cron."+operation, start, err)
+		if err != nil {
+			return mcpToolError(err), CronResult{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "cron operation completed"}}}, out, nil
+	}
+	mcp.AddTool(s, &mcp.Tool{Name: "cron_list", Description: "List CloudPanel-managed cron jobs and the revision required for changes. Requires cron:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpCronInput) (*mcp.CallToolResult, CronResult, error) {
+		return cronCall(ctx, "cron:read", cronList, in)
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "cron_create", Description: "Create a site cron job using a typed runner. raw_command additionally requires enabled cron.raw_command policy and confirm=true. Requires cron:write and the current revision."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpCronInput) (*mcp.CallToolResult, CronResult, error) {
+		return cronCall(ctx, "cron:write", cronCreate, in)
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "cron_update", Description: "Update a site cron job using the current revision. Requires cron:write."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpCronInput) (*mcp.CallToolResult, CronResult, error) {
+		return cronCall(ctx, "cron:write", cronUpdate, in)
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "cron_delete", Description: "Delete a site cron job. Requires cron:write, current revision, and confirm=true."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpCronInput) (*mcp.CallToolResult, CronResult, error) {
+		return cronCall(ctx, "cron:write", cronDelete, in)
 	})
 	mcp.AddTool(s, &mcp.Tool{Name: "tls_get_status", Description: "Read the active TLS certificate issuer, subject, serial, expiry, SANs, CloudPanel/vhost consistency, and expiry-based renewal health. It never exposes private key material. Requires tls:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpSiteInput) (*mcp.CallToolResult, TLSDetails, error) {
 		if !HasScope(t, "tls:read") {
