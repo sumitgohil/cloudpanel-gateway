@@ -12,6 +12,22 @@ go build -o cloudpanel-gateway ./cmd/cloudpanel-gateway
 
 `serve` and `helper` are separate service modes. The gateway serves REST at `/v1`, OpenAPI at `/openapi.json`, docs at `/docs`, metrics at `/metrics`, and MCP Streamable HTTP at `/mcp`.
 
+## Site log investigation
+
+The gateway exposes read-only, site-scoped log investigation through REST and MCP. It discovers CloudPanel Nginx and PHP logs plus Laravel, Symfony, WordPress, and site-local application logs. It reads only regular files, follows no path outside the site document root, and bounds requests to seven days, 1,000 returned lines, and an 8 MiB read budget.
+
+- MCP tools: `cloudpanel_site_logs_list_sources`, `cloudpanel_site_logs_query`, and `cloudpanel_site_logs_diagnose`
+- REST: `GET /v1/sites/{domain}/logs/sources`, `POST /v1/sites/{domain}/logs/query`, and `POST /v1/sites/{domain}/logs/diagnose`
+- Token scope: `logs:read`; results are redacted by default. `raw: true` is accepted only for an `admin` token.
+
+For example, issue a least-privilege diagnostic token locally:
+
+```bash
+sudo cloudpanel-gateway token create --label incident-investigation --scopes logs:read
+```
+
+The diagnosis endpoint returns deterministic evidence categories only. It never changes site configuration, files, service state, or CloudPanel resources.
+
 ## Production installation
 
 Use a signed release:
