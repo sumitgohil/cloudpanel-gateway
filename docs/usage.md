@@ -38,7 +38,9 @@ Use only the scopes a client needs:
 | `certificates:write` | Let's Encrypt and policy-gated manual certificate actions. |
 | `tls:read` | Read active certificate identity, expiry, SANs, and readiness health. |
 | `logs:read` | Redacted site log discovery, query, and diagnosis. |
+| `cron:read`, `cron:write` | List and manage CloudPanel-compatible site cron jobs. |
 | `files:write` | Deploy an owned managed ZIP artifact after local policy approval. |
+| `node:read`, `node:write`, `node:deploy`, `node:build` | Read, configure, activate, roll back, and policy-gated build Node.js/SSR releases. |
 | `backups:read`, `backups:write` | List and create/restore encrypted managed backups. |
 | `php:read`, `php:write` | PHP settings inspection and approved updates. |
 | `pagespeed:read`, `pagespeed:write` | PageSpeed inspection and configuration. |
@@ -58,9 +60,12 @@ The following actions are disabled by default even for an `admin` token:
 - manual certificate installation;
 - vhost-template writes and imports; and
 - system permission reset.
-- managed ZIP artifact deployment; and
-- active site-root artifact deployment; and
-- backup restore.
+- managed ZIP artifact and active site-root deployment;
+- backup restore;
+- Node.js/SSR release activation and rollback;
+- Node.js runtime updates/restarts; and
+- sandboxed server-side npm builds.
+- raw cron commands (`cron.raw_command`).
 
 Review and enable an operation only when required:
 
@@ -68,6 +73,22 @@ Review and enable an operation only when required:
 sudo cloudpanel-gateway policy list
 sudo cloudpanel-gateway policy enable --operation database.export
 sudo cloudpanel-gateway policy disable --operation database.export
+```
+
+## Site cron jobs
+
+Cron jobs are stored in CloudPanel and rendered to `/etc/cron.d/<site-user>`;
+they run as the site Linux user, not root. Use `cron list` to obtain the
+revision before creating, updating, or deleting a job. Typed runners support
+`php_script`, `node_script`, `site_executable`, and same-domain HTTPS
+`http_request` jobs. `raw_command` is disabled until a root administrator
+enables `cron.raw_command`, and each raw request requires `confirm=true`.
+
+```bash
+sudo cloudpanel-gateway cron list --domain wp1.psng.tech
+sudo cloudpanel-gateway cron create --domain wp1.psng.tech \
+  --if-match-revision rev_example --minute '*/5' --hour '*' --day '*' --month '*' --weekday '*' \
+  --runner php_script --target artisan --arg schedule:run
 ```
 
 ## Site settings
@@ -133,6 +154,34 @@ For MCP clients, use `artifact_begin_upload`, sequential
 `artifact_complete_upload` to receive an artifact ID. Root deployment is a
 separate `site_deploy_root_artifact` action that always creates a files safety
 backup before its atomic swap.
+
+## Static and Node.js application releases
+
+For static Vite or Astro output, build outside the server by default, ZIP the
+contents of the generated output directory (not its parent), upload it with the
+managed artifact tools, then call `static_deploy_release`. A Vite SPA can enable
+the revision-protected fallback through `static_update_routing`.
+
+For Node.js or SSR applications, use `project_inspect_artifact` before any
+build. A production release is an uploaded ZIP containing the explicit server
+entrypoint and production dependencies. `node_deploy_release` activates it as
+an immutable release and creates a generated systemd unit running only as the
+site user. The gateway pins the CloudPanel-selected Node.js binary and requires
+the process to become reachable on the CloudPanel loopback app port.
+
+Server-side builds are intentionally disabled until enabled locally:
+
+```bash
+sudo cloudpanel-gateway policy enable --operation node.server_build
+sudo cloudpanel-gateway policy enable --operation node.deploy_release
+sudo cloudpanel-gateway policy enable --operation node.runtime_manage
+```
+
+They require `node:build` and only accept npm projects with `package-lock.json`.
+The fixed `npm ci` and `npm run build` steps run in an
+unprivileged, resource-bounded systemd sandbox. Build agents must exclude
+`.git`, `.env*`, credentials, local caches, and `node_modules` from source ZIPs.
+Use external/CI builds whenever possible; server builds execute project code.
 
 ## Site log investigation
 
