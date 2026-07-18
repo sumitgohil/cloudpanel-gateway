@@ -41,7 +41,7 @@ type Config struct {
 }
 
 func DefaultConfig() Config {
-	return Config{Listen: "127.0.0.1:9780", HelperSocket: "/run/cloudpanel-gateway/helper.sock", NginxCommitSocket: "/run/cloudpanel-gateway/nginx-commit.sock", Database: "/var/lib/cloudpanel-gateway/state.db", CloudPanelDatabase: "/home/clp/htdocs/app/data/db.sq3", ArtifactDir: "/var/lib/cloudpanel-gateway/artifacts", BackupDir: "/var/lib/cloudpanel-gateway/backups", BackupKeyFile: "/var/lib/cloudpanel-gateway/backup-key", SecretFile: "/var/lib/cloudpanel-gateway/token-pepper"}
+	return Config{Listen: "127.0.0.1:9780", HelperSocket: "/run/cloudpanel-gateway/helper.sock", NginxCommitSocket: "/run/cloudpanel-gateway-nginx-commit/nginx-commit.sock", Database: "/var/lib/cloudpanel-gateway/state.db", CloudPanelDatabase: "/home/clp/htdocs/app/data/db.sq3", ArtifactDir: "/var/lib/cloudpanel-gateway/artifacts", BackupDir: "/var/lib/cloudpanel-gateway/backups", BackupKeyFile: "/var/lib/cloudpanel-gateway/backup-key", SecretFile: "/var/lib/cloudpanel-gateway/token-pepper"}
 }
 
 func LoadConfig(path string) (Config, error) {
