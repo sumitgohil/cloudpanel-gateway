@@ -3,15 +3,20 @@ package gateway
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,6 +30,7 @@ type APIServer struct {
 	requests atomic.Uint64
 	denied   atomic.Uint64
 	mcp      http.Handler
+	uploadMu sync.Mutex
 }
 type actionBody struct {
 	Args map[string]string `json:"args"`
@@ -82,6 +88,75 @@ type mcpPageSpeedInput struct {
 	EnableFilters   []string `json:"enable_filters,omitempty"`
 	DisableFilters  []string `json:"disable_filters,omitempty"`
 }
+type mcpDeployInput struct {
+	Domain     string `json:"domain"`
+	ArtifactID string `json:"artifact_id"`
+	TargetDir  string `json:"target_dir"`
+	Replace    bool   `json:"replace"`
+	Confirm    bool   `json:"confirm"`
+}
+type mcpRootDeployInput struct {
+	Domain     string `json:"domain"`
+	ArtifactID string `json:"artifact_id"`
+	Replace    bool   `json:"replace"`
+	Confirm    bool   `json:"confirm"`
+}
+type mcpBackupCreateInput struct {
+	Domain     string `json:"domain"`
+	Components string `json:"components"`
+}
+type mcpBackupRestoreInput struct {
+	Domain     string `json:"domain"`
+	BackupID   string `json:"backup_id"`
+	Components string `json:"components"`
+	Confirm    bool   `json:"confirm"`
+}
+type mcpArtifactBeginInput struct {
+	TotalChunks int `json:"total_chunks"`
+}
+type mcpArtifactChunkInput struct {
+	UploadID   string `json:"upload_id"`
+	Index      int    `json:"index"`
+	DataBase64 string `json:"data_base64"`
+}
+type mcpArtifactCompleteInput struct {
+	UploadID string `json:"upload_id"`
+}
+type mcpCronInput struct {
+	Domain          string   `json:"domain"`
+	JobID           int64    `json:"job_id,omitempty"`
+	Minute          string   `json:"minute,omitempty"`
+	Hour            string   `json:"hour,omitempty"`
+	Day             string   `json:"day,omitempty"`
+	Month           string   `json:"month,omitempty"`
+	Weekday         string   `json:"weekday,omitempty"`
+	Runner          string   `json:"runner,omitempty"`
+	Target          string   `json:"target,omitempty"`
+	Args            []string `json:"args,omitempty"`
+	Method          string   `json:"method,omitempty"`
+	URL             string   `json:"url,omitempty"`
+	RawCommand      string   `json:"raw_command,omitempty"`
+	IfMatchRevision string   `json:"if_match_revision,omitempty"`
+	Confirm         bool     `json:"confirm,omitempty"`
+}
+type mcpNodeInput struct {
+	Domain          string   `json:"domain"`
+	ArtifactID      string   `json:"artifact_id,omitempty"`
+	Framework       string   `json:"framework,omitempty"`
+	Entrypoint      string   `json:"entrypoint,omitempty"`
+	Args            []string `json:"args,omitempty"`
+	NodeVersion     string   `json:"node_version,omitempty"`
+	AppPort         int      `json:"app_port,omitempty"`
+	HealthPath      string   `json:"health_path,omitempty"`
+	IfMatchRevision string   `json:"if_match_revision,omitempty"`
+	Confirm         bool     `json:"confirm,omitempty"`
+}
+type mcpBuildInput struct {
+	Domain     string `json:"domain"`
+	ArtifactID string `json:"artifact_id"`
+	Framework  string `json:"framework"`
+	OutputDir  string `json:"output_dir,omitempty"`
+}
 type tokenContextKey struct{}
 
 func NewAPIServer(c Config, s *State, logger *slog.Logger) *APIServer {
@@ -104,6 +179,8 @@ func (a *APIServer) Handler() http.Handler {
 	mux.HandleFunc("/metrics", a.auth(a.metrics, "metrics:read"))
 	mux.Handle("/mcp", a.mcpAuth(a.mcp))
 	mux.HandleFunc("/v1/artifacts", a.auth(a.artifacts, "artifacts:write"))
+	mux.HandleFunc("/v1/artifacts/uploads/", a.auth(a.artifactUploads, "artifacts:write"))
+	mux.HandleFunc("/v1/projects/inspect", a.auth(a.projectInspect, "artifacts:write"))
 	mux.HandleFunc("/v1/sites", a.auth(a.sites, "sites:write"))
 	mux.HandleFunc("/v1/sites/", a.auth(a.siteLogs, ""))
 	mux.HandleFunc("/v1/actions/", a.auth(a.action, ""))
@@ -111,7 +188,9 @@ func (a *APIServer) Handler() http.Handler {
 }
 func (a *APIServer) limit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+		// Artifact uploads are individually constrained to 100 MiB. Other API
+		// requests remain bounded well below this by their JSON decoding rules.
+		r.Body = http.MaxBytesReader(w, r.Body, 101<<20)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
 		next.ServeHTTP(w, r)
@@ -296,7 +375,7 @@ func (a *APIServer) artifacts(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, 500, "artifact storage unavailable", requestID(r))
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 20<<20)
+	r.Body = http.MaxBytesReader(w, r.Body, maxZIPCompressed)
 	id, e := newID("artifact_", 18)
 	if e != nil {
 		jsonError(w, 500, "randomness unavailable", requestID(r))
@@ -308,18 +387,432 @@ func (a *APIServer) artifacts(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, 500, "artifact create failed", requestID(r))
 		return
 	}
-	n, e := io.Copy(f, r.Body)
+	h := sha256.New()
+	n, e := io.Copy(io.MultiWriter(f, h), r.Body)
 	closeErr := f.Close()
 	if e != nil || closeErr != nil {
 		_ = os.Remove(path)
 		jsonError(w, 400, "artifact upload failed", requestID(r))
 		return
 	}
-	jsonResponse(w, 201, map[string]any{"id": id, "size": n, "expires_in_seconds": 3600})
+	if n < 4 {
+		_ = os.Remove(path)
+		jsonError(w, 400, "artifact must be a ZIP archive", requestID(r))
+		return
+	}
+	probe, probeErr := os.Open(path)
+	if probeErr != nil {
+		jsonError(w, 500, "artifact validation failed", requestID(r))
+		return
+	}
+	magic := make([]byte, 4)
+	_, probeErr = io.ReadFull(probe, magic)
+	_ = probe.Close()
+	if probeErr != nil || string(magic[:2]) != "PK" {
+		_ = os.Remove(path)
+		jsonError(w, 400, "artifact must be a ZIP archive", requestID(r))
+		return
+	}
+	if e = validateArtifactZIP(path); e != nil {
+		_ = os.Remove(path)
+		jsonError(w, 400, e.Error(), requestID(r))
+		return
+	}
+	t, _ := r.Context().Value(tokenContextKey{}).(*Token)
+	now := time.Now().UTC()
+	artifact := Artifact{ID: id, Path: path, SHA256: hex.EncodeToString(h.Sum(nil)), Size: n, OwnerTokenID: t.ID, CreatedAt: now, ExpiresAt: now.Add(artifactTTL)}
+	if e = a.State.PutArtifact(artifact); e != nil {
+		_ = os.Remove(path)
+		jsonError(w, 500, "artifact metadata create failed", requestID(r))
+		return
+	}
+	_ = a.State.CleanupArtifacts(now)
+	jsonResponse(w, 201, map[string]any{"id": id, "sha256": artifact.SHA256, "size": n, "expires_at": artifact.ExpiresAt})
+}
+
+func (a *APIServer) beginArtifactUpload(t *Token, totalChunks int) (ArtifactUpload, error) {
+	if totalChunks < 1 || totalChunks > maxArtifactChunks {
+		return ArtifactUpload{}, fmt.Errorf("total_chunks must be between 1 and %d", maxArtifactChunks)
+	}
+	a.uploadMu.Lock()
+	defer a.uploadMu.Unlock()
+	if err := os.MkdirAll(a.Config.ArtifactDir, 0750); err != nil {
+		return ArtifactUpload{}, err
+	}
+	_ = a.State.CleanupArtifacts(time.Now())
+	id, err := newID("upload_", 18)
+	if err != nil {
+		return ArtifactUpload{}, err
+	}
+	path := filepath.Join(a.Config.ArtifactDir, "."+id+".part")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return ArtifactUpload{}, err
+	}
+	if err = f.Close(); err != nil {
+		return ArtifactUpload{}, err
+	}
+	now := time.Now().UTC()
+	u := ArtifactUpload{ID: id, Path: path, OwnerTokenID: t.ID, TotalChunks: totalChunks, CreatedAt: now, ExpiresAt: now.Add(artifactTTL)}
+	if err = a.State.PutArtifactUpload(u); err != nil {
+		_ = os.Remove(path)
+		return ArtifactUpload{}, err
+	}
+	return u, nil
+}
+func (a *APIServer) appendArtifactChunk(t *Token, id string, index int, data []byte) (ArtifactUpload, error) {
+	if len(data) == 0 || len(data) > maxArtifactChunk {
+		return ArtifactUpload{}, fmt.Errorf("chunk must be 1 through %d bytes", maxArtifactChunk)
+	}
+	a.uploadMu.Lock()
+	defer a.uploadMu.Unlock()
+	u, err := a.State.ArtifactUpload(id)
+	if err != nil {
+		return ArtifactUpload{}, errors.New("upload not found")
+	}
+	if u.OwnerTokenID != t.ID {
+		return ArtifactUpload{}, errors.New("upload is not owned by this token")
+	}
+	if time.Now().After(u.ExpiresAt) {
+		return ArtifactUpload{}, errors.New("upload expired")
+	}
+	if index != u.NextChunk || index >= u.TotalChunks {
+		return ArtifactUpload{}, errors.New("unexpected upload chunk index")
+	}
+	st, err := os.Stat(u.Path)
+	if err != nil || st.Size() != u.Size {
+		return ArtifactUpload{}, errors.New("upload state is inconsistent")
+	}
+	if u.Size+int64(len(data)) > maxZIPCompressed {
+		return ArtifactUpload{}, errors.New("artifact exceeds 100 MiB compressed limit")
+	}
+	f, err := os.OpenFile(u.Path, os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return ArtifactUpload{}, err
+	}
+	_, err = f.Write(data)
+	closeErr := f.Close()
+	if err != nil {
+		return ArtifactUpload{}, err
+	}
+	if closeErr != nil {
+		return ArtifactUpload{}, closeErr
+	}
+	u.Size += int64(len(data))
+	u.NextChunk++
+	if err = a.State.AdvanceArtifactUpload(u.ID, u.Size, u.NextChunk); err != nil {
+		return ArtifactUpload{}, err
+	}
+	return u, nil
+}
+func (a *APIServer) completeArtifactUpload(t *Token, id string) (Artifact, error) {
+	a.uploadMu.Lock()
+	defer a.uploadMu.Unlock()
+	u, err := a.State.ArtifactUpload(id)
+	if err != nil {
+		return Artifact{}, errors.New("upload not found")
+	}
+	if u.OwnerTokenID != t.ID {
+		return Artifact{}, errors.New("upload is not owned by this token")
+	}
+	if time.Now().After(u.ExpiresAt) || u.NextChunk != u.TotalChunks || u.Size < 4 {
+		return Artifact{}, errors.New("upload is incomplete or expired")
+	}
+	if err = validateArtifactZIP(u.Path); err != nil {
+		return Artifact{}, err
+	}
+	f, err := os.Open(u.Path)
+	if err != nil {
+		return Artifact{}, err
+	}
+	h := sha256.New()
+	_, err = io.Copy(h, f)
+	closeErr := f.Close()
+	if err != nil {
+		return Artifact{}, err
+	}
+	if closeErr != nil {
+		return Artifact{}, closeErr
+	}
+	artifactID, err := newID("artifact_", 18)
+	if err != nil {
+		return Artifact{}, err
+	}
+	path := filepath.Join(a.Config.ArtifactDir, artifactID)
+	if err = os.Rename(u.Path, path); err != nil {
+		return Artifact{}, err
+	}
+	now := time.Now().UTC()
+	artifact := Artifact{ID: artifactID, Path: path, SHA256: hex.EncodeToString(h.Sum(nil)), Size: u.Size, OwnerTokenID: t.ID, CreatedAt: now, ExpiresAt: now.Add(artifactTTL)}
+	if err = a.State.PutArtifact(artifact); err != nil {
+		_ = os.Rename(path, u.Path)
+		return Artifact{}, err
+	}
+	if err = a.State.DeleteArtifactUpload(u.ID); err != nil {
+		return Artifact{}, err
+	}
+	return artifact, nil
+}
+func (a *APIServer) artifactUploads(w http.ResponseWriter, r *http.Request) {
+	t, _ := r.Context().Value(tokenContextKey{}).(*Token)
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/artifacts/uploads/"), "/"), "/")
+	if len(parts) == 1 && parts[0] == "begin" && r.Method == http.MethodPost {
+		var in struct {
+			TotalChunks int `json:"total_chunks"`
+		}
+		if json.NewDecoder(r.Body).Decode(&in) != nil {
+			jsonError(w, 400, "invalid JSON upload request", requestID(r))
+			return
+		}
+		out, e := a.beginArtifactUpload(t, in.TotalChunks)
+		if e != nil {
+			jsonError(w, 400, e.Error(), requestID(r))
+			return
+		}
+		jsonResponse(w, 201, map[string]any{"upload_id": out.ID, "max_chunk_bytes": maxArtifactChunk, "expires_at": out.ExpiresAt})
+		return
+	}
+	if len(parts) == 2 && r.Method == http.MethodPost {
+		if parts[1] == "chunk" {
+			var in struct {
+				Index      int    `json:"index"`
+				DataBase64 string `json:"data_base64"`
+			}
+			d := json.NewDecoder(r.Body)
+			d.DisallowUnknownFields()
+			if d.Decode(&in) != nil || len(in.DataBase64) > base64.StdEncoding.EncodedLen(maxArtifactChunk) {
+				jsonError(w, 400, "invalid upload chunk", requestID(r))
+				return
+			}
+			data, e := base64.StdEncoding.DecodeString(in.DataBase64)
+			if e != nil {
+				jsonError(w, 400, "invalid base64 chunk", requestID(r))
+				return
+			}
+			out, e := a.appendArtifactChunk(t, parts[0], in.Index, data)
+			if e != nil {
+				jsonError(w, 400, e.Error(), requestID(r))
+				return
+			}
+			jsonResponse(w, 200, map[string]any{"upload_id": out.ID, "next_chunk": out.NextChunk, "size": out.Size})
+			return
+		}
+		if parts[1] == "complete" {
+			out, e := a.completeArtifactUpload(t, parts[0])
+			if e != nil {
+				jsonError(w, 400, e.Error(), requestID(r))
+				return
+			}
+			jsonResponse(w, 201, map[string]any{"id": out.ID, "sha256": out.SHA256, "size": out.Size, "expires_at": out.ExpiresAt})
+			return
+		}
+	}
+	jsonError(w, 404, "artifact upload endpoint not found", requestID(r))
+}
+
+func (a *APIServer) projectInspect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var in struct {
+		ArtifactID string `json:"artifact_id"`
+	}
+	d := json.NewDecoder(r.Body)
+	d.DisallowUnknownFields()
+	if d.Decode(&in) != nil {
+		jsonError(w, http.StatusBadRequest, "invalid JSON project inspection request", requestID(r))
+		return
+	}
+	t, _ := r.Context().Value(tokenContextKey{}).(*Token)
+	var out ProjectInspection
+	start := time.Now()
+	err := CallTypedHelper(r.Context(), a.Config, HelperRequest{Node: &NodeRequest{Operation: nodeInspect, ArtifactID: in.ArtifactID, OwnerTokenID: t.ID, Domain: "project.invalid"}}, &out)
+	a.auditMCP(t, "project.inspect_artifact", start, err)
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error(), requestID(r))
+		return
+	}
+	jsonResponse(w, http.StatusOK, out)
+}
+
+func (a *APIServer) siteNode(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) < 2 || ValidateDomain(parts[0]) != nil {
+		jsonError(w, http.StatusNotFound, "Node.js endpoint not found", requestID(r))
+		return
+	}
+	domain := parts[0]
+	t, _ := r.Context().Value(tokenContextKey{}).(*Token)
+	operation, scope := "", ""
+	if parts[1] == "builds" && len(parts) == 2 && r.Method == http.MethodPost {
+		operation, scope = "build", "node:build"
+	} else if parts[1] == "node" {
+		switch {
+		case len(parts) == 2 && r.Method == http.MethodGet:
+			operation, scope = nodeGetSettings, "node:read"
+		case len(parts) == 2 && r.Method == http.MethodPatch:
+			operation, scope = nodeUpdate, "node:write"
+		case len(parts) == 3 && parts[2] == "status" && r.Method == http.MethodGet:
+			operation, scope = nodeStatus, "node:read"
+		case len(parts) == 3 && parts[2] == "restart" && r.Method == http.MethodPost:
+			operation, scope = nodeRestart, "node:write"
+		case len(parts) == 3 && parts[2] == "releases" && r.Method == http.MethodGet:
+			operation, scope = nodeList, "node:read"
+		case len(parts) == 3 && parts[2] == "releases" && r.Method == http.MethodPost:
+			operation, scope = nodeDeploy, "node:deploy"
+		case len(parts) == 3 && parts[2] == "rollback" && r.Method == http.MethodPost:
+			operation, scope = nodeRollback, "node:deploy"
+		}
+	}
+	if operation == "" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if t == nil || !HasScope(t, scope) {
+		a.denied.Add(1)
+		jsonError(w, http.StatusForbidden, "insufficient scope", requestID(r))
+		return
+	}
+	start := time.Now()
+	var out any
+	var err error
+	if operation == "build" {
+		var in mcpBuildInput
+		d := json.NewDecoder(r.Body)
+		d.DisallowUnknownFields()
+		if d.Decode(&in) != nil {
+			jsonError(w, 400, "invalid JSON build request", requestID(r))
+			return
+		}
+		value := BuildResult{}
+		err = CallTypedHelper(r.Context(), a.Config, HelperRequest{Build: &BuildRequest{Domain: domain, ArtifactID: in.ArtifactID, OwnerTokenID: t.ID, Framework: in.Framework, OutputDir: in.OutputDir}}, &value)
+		out = value
+	} else {
+		in := mcpNodeInput{Domain: domain}
+		if r.Method != http.MethodGet {
+			d := json.NewDecoder(r.Body)
+			d.DisallowUnknownFields()
+			if d.Decode(&in) != nil {
+				jsonError(w, 400, "invalid JSON Node.js request", requestID(r))
+				return
+			}
+			in.Domain = domain
+		}
+		value := any(nil)
+		switch operation {
+		case nodeGetSettings:
+			value = &NodeSettings{}
+		case nodeStatus:
+			value = &NodeStatus{}
+		case nodeList:
+			value = &NodeReleaseList{}
+		default:
+			value = &NodeStatus{}
+		}
+		err = CallTypedHelper(r.Context(), a.Config, HelperRequest{Node: &NodeRequest{Operation: operation, Domain: domain, ArtifactID: in.ArtifactID, OwnerTokenID: t.ID, Framework: in.Framework, Entrypoint: in.Entrypoint, Args: in.Args, NodeVersion: in.NodeVersion, AppPort: in.AppPort, HealthPath: in.HealthPath, IfMatchRevision: in.IfMatchRevision, Confirm: in.Confirm}}, value)
+		out = value
+	}
+	a.auditMCP(t, "node."+operation, start, err)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "revision conflict") {
+			status = http.StatusConflict
+		}
+		jsonError(w, status, err.Error(), requestID(r))
+		return
+	}
+	jsonResponse(w, http.StatusOK, out)
+}
+
+func (a *APIServer) siteStatic(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) == 3 && parts[2] == "deploy" && r.Method == http.MethodPost && ValidateDomain(parts[0]) == nil {
+		t, _ := r.Context().Value(tokenContextKey{}).(*Token)
+		if t == nil || !HasScope(t, "files:write") {
+			a.denied.Add(1)
+			jsonError(w, http.StatusForbidden, "insufficient scope", requestID(r))
+			return
+		}
+		var in DeployRequest
+		d := json.NewDecoder(r.Body)
+		d.DisallowUnknownFields()
+		if d.Decode(&in) != nil {
+			jsonError(w, 400, "invalid JSON static deployment request", requestID(r))
+			return
+		}
+		in.Domain, in.OwnerTokenID, in.Root, in.Static = parts[0], t.ID, true, true
+		out := DeploymentResult{}
+		start := time.Now()
+		err := CallTypedHelper(r.Context(), a.Config, HelperRequest{Deploy: &in}, &out)
+		a.auditMCP(t, "static.deploy_release", start, err)
+		if err != nil {
+			jsonError(w, 400, err.Error(), requestID(r))
+			return
+		}
+		jsonResponse(w, http.StatusOK, out)
+		return
+	}
+	if len(parts) != 2 || ValidateDomain(parts[0]) != nil {
+		jsonError(w, http.StatusNotFound, "static endpoint not found", requestID(r))
+		return
+	}
+	operation, scope := "", ""
+	if r.Method == http.MethodGet {
+		operation, scope = staticGetRouting, "sites:read"
+	} else if r.Method == http.MethodPatch {
+		operation, scope = staticUpdateRouting, "sites:write"
+	} else {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	t, _ := r.Context().Value(tokenContextKey{}).(*Token)
+	if t == nil || !HasScope(t, scope) {
+		a.denied.Add(1)
+		jsonError(w, http.StatusForbidden, "insufficient scope", requestID(r))
+		return
+	}
+	req := StaticRequest{Operation: operation, Domain: parts[0]}
+	if r.Method == http.MethodPatch {
+		d := json.NewDecoder(r.Body)
+		d.DisallowUnknownFields()
+		if d.Decode(&req) != nil {
+			jsonError(w, http.StatusBadRequest, "invalid JSON static settings request", requestID(r))
+			return
+		}
+		req.Operation, req.Domain = operation, parts[0]
+	}
+	start := time.Now()
+	out := StaticSettings{}
+	err := CallTypedHelper(r.Context(), a.Config, HelperRequest{Static: &req}, &out)
+	a.auditMCP(t, "static."+operation, start, err)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "revision conflict") {
+			status = http.StatusConflict
+		}
+		jsonError(w, status, err.Error(), requestID(r))
+		return
+	}
+	jsonResponse(w, http.StatusOK, out)
 }
 
 func (a *APIServer) siteLogs(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/sites/"), "/")
+	if len(parts) >= 2 && (parts[1] == "tls" || parts[1] == "deployments" || parts[1] == "backups") {
+		a.siteOperations(w, r, parts)
+		return
+	}
+	if len(parts) >= 2 && parts[1] == "cron-jobs" {
+		a.siteCron(w, r, parts)
+		return
+	}
+	if len(parts) >= 2 && (parts[1] == "node" || parts[1] == "builds") {
+		a.siteNode(w, r, parts)
+		return
+	}
+	if len(parts) >= 2 && parts[1] == "static" {
+		a.siteStatic(w, r, parts)
+		return
+	}
 	if len(parts) >= 2 && parts[1] != "logs" {
 		a.siteSettings(w, r, parts)
 		return
@@ -381,6 +874,199 @@ func (a *APIServer) siteLogs(w http.ResponseWriter, r *http.Request) {
 	default:
 		jsonError(w, http.StatusNotFound, "log endpoint not found", requestID(r))
 	}
+}
+
+func (a *APIServer) siteOperations(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) < 2 || ValidateDomain(parts[0]) != nil {
+		jsonError(w, 404, "site operation not found", requestID(r))
+		return
+	}
+	domain, operation := parts[0], parts[1]
+	t, _ := r.Context().Value(tokenContextKey{}).(*Token)
+	need := ""
+	switch operation {
+	case "tls":
+		need = "tls:read"
+	case "deployments":
+		need = "files:write"
+	case "backups":
+		if r.Method == http.MethodGet {
+			need = "backups:read"
+		} else {
+			need = "backups:write"
+		}
+	}
+	if t == nil || !HasScope(t, need) {
+		a.denied.Add(1)
+		jsonError(w, 403, "insufficient scope", requestID(r))
+		return
+	}
+	start := time.Now()
+	var out any
+	var err error
+	var action string
+	switch operation {
+	case "tls":
+		if r.Method != http.MethodGet || len(parts) != 2 {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		action = "tls.get_status"
+		value := TLSDetails{}
+		err = CallTypedHelper(r.Context(), a.Config, HelperRequest{TLS: &TLSRequest{Domain: domain}}, &value)
+		out = value
+	case "deployments":
+		if r.Method != http.MethodPost || (len(parts) != 2 && !(len(parts) == 3 && parts[2] == "root")) {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var in DeployRequest
+		d := json.NewDecoder(r.Body)
+		d.DisallowUnknownFields()
+		if d.Decode(&in) != nil {
+			jsonError(w, 400, "invalid JSON deployment request", requestID(r))
+			return
+		}
+		in.Domain = domain
+		in.OwnerTokenID = t.ID
+		in.Root = len(parts) == 3
+		if in.Root {
+			action = "file.deploy_root"
+		} else {
+			action = "file.deploy_artifact"
+		}
+		value := DeploymentResult{}
+		err = CallTypedHelper(r.Context(), a.Config, HelperRequest{Deploy: &in}, &value)
+		out = value
+	case "backups":
+		if len(parts) == 2 && r.Method == http.MethodGet {
+			action = "backup.list"
+			value := map[string]any{}
+			err = CallTypedHelper(r.Context(), a.Config, HelperRequest{Backup: &BackupRequest{Operation: "list", Domain: domain}}, &value)
+			out = value
+		} else if len(parts) == 2 && r.Method == http.MethodPost {
+			var in struct {
+				Components string `json:"components"`
+			}
+			d := json.NewDecoder(r.Body)
+			d.DisallowUnknownFields()
+			if d.Decode(&in) != nil {
+				jsonError(w, 400, "invalid JSON backup request", requestID(r))
+				return
+			}
+			action = "backup.create"
+			value := BackupResult{}
+			err = CallTypedHelper(r.Context(), a.Config, HelperRequest{Backup: &BackupRequest{Operation: "create", Domain: domain, Components: in.Components}}, &value)
+			out = value
+		} else if len(parts) == 4 && parts[2] != "" && parts[3] == "restore" && r.Method == http.MethodPost {
+			var in struct {
+				Components string `json:"components"`
+				Confirm    bool   `json:"confirm"`
+			}
+			d := json.NewDecoder(r.Body)
+			d.DisallowUnknownFields()
+			if d.Decode(&in) != nil {
+				jsonError(w, 400, "invalid JSON restore request", requestID(r))
+				return
+			}
+			action = "backup.restore"
+			value := BackupResult{}
+			err = CallTypedHelper(r.Context(), a.Config, HelperRequest{Backup: &BackupRequest{Operation: "restore", Domain: domain, BackupID: parts[2], Components: in.Components, Confirm: in.Confirm}}, &value)
+			out = value
+		} else {
+			jsonError(w, 404, "backup endpoint not found", requestID(r))
+			return
+		}
+	default:
+		jsonError(w, 404, "site operation not found", requestID(r))
+		return
+	}
+	outcome, detail := "ok", "site operation completed"
+	if err != nil {
+		outcome, detail = "error", "site operation failed"
+	}
+	a.State.Audit(requestID(r), t.ID, action, outcome, detail, time.Since(start))
+	if err != nil {
+		jsonError(w, 400, err.Error(), requestID(r))
+		return
+	}
+	jsonResponse(w, 200, out)
+}
+
+func (a *APIServer) siteCron(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) < 2 || parts[1] != "cron-jobs" || ValidateDomain(parts[0]) != nil {
+		jsonError(w, http.StatusNotFound, "cron endpoint not found", requestID(r))
+		return
+	}
+	t, _ := r.Context().Value(tokenContextKey{}).(*Token)
+	need := "cron:write"
+	if r.Method == http.MethodGet {
+		need = "cron:read"
+	}
+	if t == nil || !HasScope(t, need) {
+		a.denied.Add(1)
+		jsonError(w, http.StatusForbidden, "insufficient scope", requestID(r))
+		return
+	}
+	domain := parts[0]
+	request := CronRequest{Domain: domain}
+	switch {
+	case len(parts) == 2 && r.Method == http.MethodGet:
+		request.Operation = cronList
+	case len(parts) == 2 && r.Method == http.MethodPost:
+		request.Operation = cronCreate
+		if err := decodeCronRequest(r, &request); err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error(), requestID(r))
+			return
+		}
+	case len(parts) == 3 && r.Method == http.MethodPatch:
+		id, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || id < 1 {
+			jsonError(w, http.StatusNotFound, "cron job not found", requestID(r))
+			return
+		}
+		request.Operation, request.JobID = cronUpdate, id
+		if err := decodeCronRequest(r, &request); err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error(), requestID(r))
+			return
+		}
+	case len(parts) == 3 && r.Method == http.MethodDelete:
+		id, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || id < 1 {
+			jsonError(w, http.StatusNotFound, "cron job not found", requestID(r))
+			return
+		}
+		request.Operation, request.JobID = cronDelete, id
+		if err := decodeCronRequest(r, &request); err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error(), requestID(r))
+			return
+		}
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	start := time.Now()
+	out := CronResult{}
+	err := CallTypedHelper(r.Context(), a.Config, HelperRequest{Cron: &request}, &out)
+	auditAction := "cron." + request.Operation
+	if err != nil {
+		a.State.Audit(requestID(r), t.ID, auditAction, "error", "site cron operation failed", time.Since(start))
+		jsonError(w, http.StatusBadRequest, err.Error(), requestID(r))
+		return
+	}
+	a.State.Audit(requestID(r), t.ID, auditAction, "ok", "site cron operation completed", time.Since(start))
+	jsonResponse(w, http.StatusOK, out)
+}
+
+func decodeCronRequest(r *http.Request, out *CronRequest) error {
+	operation, domain, jobID := out.Operation, out.Domain, out.JobID
+	d := json.NewDecoder(r.Body)
+	d.DisallowUnknownFields()
+	if err := d.Decode(out); err != nil {
+		return errors.New("invalid JSON cron request")
+	}
+	out.Operation, out.Domain, out.JobID = operation, domain, jobID
+	return nil
 }
 
 func (a *APIServer) siteSettings(w http.ResponseWriter, r *http.Request, parts []string) {
@@ -533,15 +1219,45 @@ func (a *APIServer) openapi(w http.ResponseWriter, r *http.Request) {
 		"/v1/sites/{domain}/php":                                map[string]any{"get": map[string]any{"summary": "Read safe PHP settings", "responses": response(map[string]any{"$ref": "#/components/schemas/PHPSettings"})}, "patch": map[string]any{"summary": "Update reviewed PHP settings", "responses": response(map[string]any{"$ref": "#/components/schemas/PHPSettings"})}},
 		"/v1/sites/{domain}/pagespeed":                          map[string]any{"get": map[string]any{"summary": "Read PageSpeed settings", "responses": response(map[string]any{"$ref": "#/components/schemas/PageSpeed"})}, "patch": map[string]any{"summary": "Update PageSpeed preset and filters", "responses": response(map[string]any{"$ref": "#/components/schemas/PageSpeed"})}},
 		"/v1/sites/{domain}/pagespeed/purge":                    map[string]any{"post": map[string]any{"summary": "Purge the validated per-site PageSpeed cache", "responses": response(map[string]any{"type": "object"})}},
-		"/mcp":                                                  map[string]any{"post": map[string]string{"summary": "MCP Streamable HTTP endpoint"}},
+		"/v1/sites/{domain}/cron-jobs":                          map[string]any{"get": map[string]any{"summary": "List CloudPanel site cron jobs (cron:read)", "responses": response(map[string]any{"$ref": "#/components/schemas/CronResult"})}, "post": map[string]any{"summary": "Create a typed cron job (cron:write; raw commands require cron.raw_command policy)", "responses": response(map[string]any{"$ref": "#/components/schemas/CronResult"})}},
+		"/v1/sites/{domain}/cron-jobs/{job_id}":                 map[string]any{"patch": map[string]any{"summary": "Update a cron job with its current revision", "responses": response(map[string]any{"$ref": "#/components/schemas/CronResult"})}, "delete": map[string]any{"summary": "Delete a cron job with confirm=true", "responses": response(map[string]any{"$ref": "#/components/schemas/CronResult"})}},
+		"/v1/sites/{domain}/tls":                                map[string]any{"get": map[string]any{"summary": "Read certificate details and expiry-based renewal health (tls:read)", "responses": response(map[string]any{"$ref": "#/components/schemas/TLSDetails"})}},
+		"/v1/sites/{domain}/deployments":                        map[string]any{"post": map[string]any{"summary": "Deploy a managed ZIP artifact (files:write plus file.deploy_artifact policy)", "responses": response(map[string]any{"$ref": "#/components/schemas/Deployment"})}},
+		"/v1/sites/{domain}/deployments/root":                   map[string]any{"post": map[string]any{"summary": "Replace active root after a mandatory safety backup (files:write, file.deploy_root policy, replace=true, confirm=true)", "responses": response(map[string]any{"$ref": "#/components/schemas/Deployment"})}},
+		"/v1/projects/inspect":                                  map[string]any{"post": map[string]any{"summary": "Inspect a token-owned source artifact without executing it", "responses": response(map[string]any{"$ref": "#/components/schemas/ProjectInspection"})}},
+		"/v1/sites/{domain}/builds":                             map[string]any{"post": map[string]any{"summary": "Policy-gated sandboxed npm build", "responses": response(map[string]any{"$ref": "#/components/schemas/BuildResult"})}},
+		"/v1/sites/{domain}/static":                             map[string]any{"get": map[string]any{"summary": "Read static SPA routing", "responses": response(map[string]any{"$ref": "#/components/schemas/StaticSettings"})}, "patch": map[string]any{"summary": "Update managed SPA routing", "responses": response(map[string]any{"$ref": "#/components/schemas/StaticSettings"})}},
+		"/v1/sites/{domain}/static/deploy":                      map[string]any{"post": map[string]any{"summary": "Deploy a static release to the active root", "responses": response(map[string]any{"$ref": "#/components/schemas/Deployment"})}},
+		"/v1/sites/{domain}/node":                               map[string]any{"get": map[string]any{"summary": "Read Node.js settings", "responses": response(map[string]any{"$ref": "#/components/schemas/NodeSettings"})}, "patch": map[string]any{"summary": "Update Node.js settings", "responses": response(map[string]any{"$ref": "#/components/schemas/NodeSettings"})}},
+		"/v1/sites/{domain}/node/status":                        map[string]any{"get": map[string]any{"summary": "Read Node.js runtime status", "responses": response(map[string]any{"$ref": "#/components/schemas/NodeStatus"})}},
+		"/v1/sites/{domain}/node/restart":                       map[string]any{"post": map[string]any{"summary": "Restart generated Node.js service", "responses": response(map[string]any{"$ref": "#/components/schemas/NodeStatus"})}},
+		"/v1/sites/{domain}/node/releases":                      map[string]any{"get": map[string]any{"summary": "List Node.js releases", "responses": response(map[string]any{"type": "array"})}, "post": map[string]any{"summary": "Deploy a Node.js release", "responses": response(map[string]any{"$ref": "#/components/schemas/NodeStatus"})}},
+		"/v1/sites/{domain}/node/rollback":                      map[string]any{"post": map[string]any{"summary": "Rollback a Node.js release", "responses": response(map[string]any{"$ref": "#/components/schemas/NodeStatus"})}},
+		"/v1/artifacts/uploads/begin":                           map[string]any{"post": map[string]any{"summary": "Begin a bounded token-owned chunked upload", "responses": response(map[string]any{"type": "object"})}},
+		"/v1/artifacts/uploads/{upload_id}/chunk":               map[string]any{"post": map[string]any{"summary": "Store one sequential base64 chunk", "responses": response(map[string]any{"type": "object"})}},
+		"/v1/artifacts/uploads/{upload_id}/complete":            map[string]any{"post": map[string]any{"summary": "Validate and finalize a ZIP artifact upload", "responses": response(map[string]any{"$ref": "#/components/schemas/Artifact"})}},
+		"/v1/sites/{domain}/backups":                            map[string]any{"get": map[string]any{"summary": "List managed encrypted backups (backups:read)", "responses": response(map[string]any{"type": "object"})}, "post": map[string]any{"summary": "Create a managed encrypted backup (backups:write)", "responses": response(map[string]any{"$ref": "#/components/schemas/BackupResult"})}},
+		"/v1/sites/{domain}/backups/{backup_id}/restore":        map[string]any{"post": map[string]any{"summary": "Restore selected components with confirm=true (backups:write plus backup.restore policy)", "responses": response(map[string]any{"$ref": "#/components/schemas/BackupResult"})}},
+		"/mcp": map[string]any{"post": map[string]string{"summary": "MCP Streamable HTTP endpoint"}},
 	}, "components": map[string]any{"schemas": map[string]any{
-		"LogSource":        map[string]any{"type": "object", "properties": map[string]any{"id": map[string]string{"type": "string"}, "kind": map[string]string{"type": "string"}, "path": map[string]string{"type": "string", "description": "Safe relative path only"}, "rotated": map[string]string{"type": "boolean"}, "size": map[string]string{"type": "integer"}, "modified": map[string]string{"type": "string", "format": "date-time"}}},
-		"LogLine":          map[string]any{"type": "object", "properties": map[string]any{"source": map[string]string{"type": "string"}, "timestamp": map[string]string{"type": "string", "format": "date-time"}, "timestamp_unknown": map[string]string{"type": "boolean"}, "line": map[string]string{"type": "string"}}},
-		"LogSignal":        map[string]any{"type": "object", "properties": map[string]any{"category": map[string]string{"type": "string"}, "count": map[string]string{"type": "integer"}, "sample": map[string]string{"type": "string"}}},
-		"SiteSettings":     map[string]any{"type": "object", "properties": map[string]any{"domain": map[string]string{"type": "string"}, "type": map[string]string{"type": "string"}, "site_user": map[string]string{"type": "string"}, "root_directory": map[string]string{"type": "string"}, "revision": map[string]string{"type": "string"}}},
-		"PHPSettings":      map[string]any{"type": "object", "properties": map[string]any{"applicable": map[string]string{"type": "boolean"}, "php_version": map[string]string{"type": "string"}, "values": map[string]any{"type": "object", "additionalProperties": map[string]string{"type": "string"}}, "revision": map[string]string{"type": "string"}}},
-		"PageSpeed":        map[string]any{"type": "object", "properties": map[string]any{"available": map[string]string{"type": "boolean"}, "enabled": map[string]string{"type": "boolean"}, "preset": map[string]string{"type": "string"}, "revision": map[string]string{"type": "string"}}},
-		"PasswordRotation": map[string]any{"type": "object", "properties": map[string]any{"site_user": map[string]string{"type": "string"}, "password": map[string]string{"type": "string", "writeOnly": "true"}}},
+		"LogSource":         map[string]any{"type": "object", "properties": map[string]any{"id": map[string]string{"type": "string"}, "kind": map[string]string{"type": "string"}, "path": map[string]string{"type": "string", "description": "Safe relative path only"}, "rotated": map[string]string{"type": "boolean"}, "size": map[string]string{"type": "integer"}, "modified": map[string]string{"type": "string", "format": "date-time"}}},
+		"LogLine":           map[string]any{"type": "object", "properties": map[string]any{"source": map[string]string{"type": "string"}, "timestamp": map[string]string{"type": "string", "format": "date-time"}, "timestamp_unknown": map[string]string{"type": "boolean"}, "line": map[string]string{"type": "string"}}},
+		"LogSignal":         map[string]any{"type": "object", "properties": map[string]any{"category": map[string]string{"type": "string"}, "count": map[string]string{"type": "integer"}, "sample": map[string]string{"type": "string"}}},
+		"SiteSettings":      map[string]any{"type": "object", "properties": map[string]any{"domain": map[string]string{"type": "string"}, "type": map[string]string{"type": "string"}, "site_user": map[string]string{"type": "string"}, "root_directory": map[string]string{"type": "string"}, "revision": map[string]string{"type": "string"}}},
+		"PHPSettings":       map[string]any{"type": "object", "properties": map[string]any{"applicable": map[string]string{"type": "boolean"}, "php_version": map[string]string{"type": "string"}, "values": map[string]any{"type": "object", "additionalProperties": map[string]string{"type": "string"}}, "revision": map[string]string{"type": "string"}}},
+		"PageSpeed":         map[string]any{"type": "object", "properties": map[string]any{"available": map[string]string{"type": "boolean"}, "enabled": map[string]string{"type": "boolean"}, "preset": map[string]string{"type": "string"}, "revision": map[string]string{"type": "string"}}},
+		"CronResult":        map[string]any{"type": "object", "properties": map[string]any{"domain": map[string]string{"type": "string"}, "revision": map[string]string{"type": "string"}, "jobs": map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/CronJob"}}}},
+		"CronJob":           map[string]any{"type": "object", "properties": map[string]any{"id": map[string]string{"type": "integer"}, "minute": map[string]string{"type": "string"}, "hour": map[string]string{"type": "string"}, "day": map[string]string{"type": "string"}, "month": map[string]string{"type": "string"}, "weekday": map[string]string{"type": "string"}, "runner": map[string]string{"type": "string"}, "target": map[string]string{"type": "string"}, "command": map[string]string{"type": "string"}}},
+		"PasswordRotation":  map[string]any{"type": "object", "properties": map[string]any{"site_user": map[string]string{"type": "string"}, "password": map[string]string{"type": "string", "writeOnly": "true"}}},
+		"TLSDetails":        map[string]any{"type": "object", "properties": map[string]any{"issuer": map[string]string{"type": "string"}, "subject": map[string]string{"type": "string"}, "expires_at": map[string]string{"type": "string", "format": "date-time"}, "sans": map[string]any{"type": "array", "items": map[string]string{"type": "string"}}, "renewal_health": map[string]string{"type": "string"}}},
+		"Deployment":        map[string]any{"type": "object", "properties": map[string]any{"artifact_id": map[string]string{"type": "string"}, "sha256": map[string]string{"type": "string"}, "target_dir": map[string]string{"type": "string"}, "files": map[string]string{"type": "integer"}}},
+		"Artifact":          map[string]any{"type": "object", "properties": map[string]any{"id": map[string]string{"type": "string"}, "sha256": map[string]string{"type": "string"}, "size": map[string]string{"type": "integer"}, "expires_at": map[string]string{"type": "string", "format": "date-time"}}},
+		"BackupResult":      map[string]any{"type": "object", "properties": map[string]any{"backup": map[string]any{"type": "object"}, "retention": map[string]any{"type": "object"}, "safety_backup_id": map[string]string{"type": "string"}}},
+		"ProjectInspection": map[string]any{"type": "object", "properties": map[string]any{"artifact_id": map[string]string{"type": "string"}, "package_manager": map[string]string{"type": "string"}, "has_package_lock": map[string]string{"type": "boolean"}, "framework": map[string]string{"type": "string"}}},
+		"BuildResult":       map[string]any{"type": "object", "properties": map[string]any{"build_id": map[string]string{"type": "string"}, "artifact_id": map[string]string{"type": "string"}, "status": map[string]string{"type": "string"}}},
+		"StaticSettings":    map[string]any{"type": "object", "properties": map[string]any{"domain": map[string]string{"type": "string"}, "spa_fallback": map[string]string{"type": "boolean"}, "revision": map[string]string{"type": "string"}}},
+		"NodeSettings":      map[string]any{"type": "object", "properties": map[string]any{"domain": map[string]string{"type": "string"}, "node_version": map[string]string{"type": "string"}, "app_port": map[string]string{"type": "integer"}, "revision": map[string]string{"type": "string"}}},
+		"NodeStatus":        map[string]any{"type": "object", "properties": map[string]any{"unit": map[string]string{"type": "string"}, "node_version": map[string]string{"type": "string"}, "app_port": map[string]string{"type": "integer"}, "service_active": map[string]string{"type": "boolean"}, "loopback_ready": map[string]string{"type": "boolean"}}},
 	}}})
 }
 func (a *APIServer) docs(w http.ResponseWriter, r *http.Request) {
@@ -670,7 +1386,272 @@ func (a *APIServer) newMCP(t *Token) *mcp.Server {
 		res, err := settingsCall(ctx, settingsPurgePS, "cache:purge", SettingsRequest{Domain: in.Domain}, &out)
 		return res, out, err
 	})
+	cronCall := func(ctx context.Context, scope, operation string, in mcpCronInput) (*mcp.CallToolResult, CronResult, error) {
+		if !HasScope(t, scope) {
+			return mcpScopeError(), CronResult{}, nil
+		}
+		out := CronResult{}
+		request := CronRequest{Operation: operation, Domain: in.Domain, JobID: in.JobID, Minute: in.Minute, Hour: in.Hour, Day: in.Day, Month: in.Month, Weekday: in.Weekday, Runner: in.Runner, Target: in.Target, Args: in.Args, Method: in.Method, URL: in.URL, RawCommand: in.RawCommand, IfMatchRevision: in.IfMatchRevision, Confirm: in.Confirm}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Cron: &request}, &out)
+		a.auditMCP(t, "cron."+operation, start, err)
+		if err != nil {
+			return mcpToolError(err), CronResult{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "cron operation completed"}}}, out, nil
+	}
+	mcp.AddTool(s, &mcp.Tool{Name: "cron_list", Description: "List CloudPanel-managed cron jobs and the revision required for changes. Requires cron:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpCronInput) (*mcp.CallToolResult, CronResult, error) {
+		return cronCall(ctx, "cron:read", cronList, in)
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "cron_create", Description: "Create a site cron job using a typed runner. raw_command additionally requires enabled cron.raw_command policy and confirm=true. Requires cron:write and the current revision."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpCronInput) (*mcp.CallToolResult, CronResult, error) {
+		return cronCall(ctx, "cron:write", cronCreate, in)
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "cron_update", Description: "Update a site cron job using the current revision. Requires cron:write."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpCronInput) (*mcp.CallToolResult, CronResult, error) {
+		return cronCall(ctx, "cron:write", cronUpdate, in)
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "cron_delete", Description: "Delete a site cron job. Requires cron:write, current revision, and confirm=true."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpCronInput) (*mcp.CallToolResult, CronResult, error) {
+		return cronCall(ctx, "cron:write", cronDelete, in)
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "tls_get_status", Description: "Read the active TLS certificate issuer, subject, serial, expiry, SANs, CloudPanel/vhost consistency, and expiry-based renewal health. It never exposes private key material. Requires tls:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpSiteInput) (*mcp.CallToolResult, TLSDetails, error) {
+		if !HasScope(t, "tls:read") {
+			return mcpScopeError(), TLSDetails{}, nil
+		}
+		out := TLSDetails{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{TLS: &TLSRequest{Domain: in.Domain}}, &out)
+		a.auditMCP(t, "tls.get_status", start, err)
+		if err != nil {
+			return mcpToolError(err), TLSDetails{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "TLS status retrieved"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "file_deploy_artifact", Description: "Deploy a previously uploaded managed ZIP artifact into an existing site-root-relative directory. Requires files:write and locally enabled file.deploy_artifact policy. Existing non-empty targets additionally require replace=true and confirm=true."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpDeployInput) (*mcp.CallToolResult, DeploymentResult, error) {
+		if !HasScope(t, "files:write") {
+			return mcpScopeError(), DeploymentResult{}, nil
+		}
+		out := DeploymentResult{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Deploy: &DeployRequest{Domain: in.Domain, ArtifactID: in.ArtifactID, TargetDir: in.TargetDir, Replace: in.Replace, Confirm: in.Confirm, OwnerTokenID: t.ID}}, &out)
+		a.auditMCP(t, "file.deploy_artifact", start, err)
+		if err != nil {
+			return mcpToolError(err), DeploymentResult{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "artifact deployed"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "site_deploy_root_artifact", Description: "Replace a site's active document root from a managed ZIP artifact. It first creates an encrypted files safety backup, then performs an atomic directory swap. Requires files:write, local file.deploy_root policy, replace=true, and confirm=true."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpRootDeployInput) (*mcp.CallToolResult, DeploymentResult, error) {
+		if !HasScope(t, "files:write") {
+			return mcpScopeError(), DeploymentResult{}, nil
+		}
+		out := DeploymentResult{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Deploy: &DeployRequest{Domain: in.Domain, ArtifactID: in.ArtifactID, Replace: in.Replace, Confirm: in.Confirm, Root: true, OwnerTokenID: t.ID}}, &out)
+		a.auditMCP(t, "file.deploy_root", start, err)
+		if err != nil {
+			return mcpToolError(err), DeploymentResult{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "site root deployed after safety backup"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "static_get_settings", Description: "Read whether a CloudPanel static site has gateway-managed Vite-style SPA fallback routing. Requires sites:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpSiteInput) (*mcp.CallToolResult, StaticSettings, error) {
+		if !HasScope(t, "sites:read") {
+			return mcpScopeError(), StaticSettings{}, nil
+		}
+		out := StaticSettings{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Static: &StaticRequest{Operation: staticGetRouting, Domain: in.Domain}}, &out)
+		a.auditMCP(t, "static.get_routing", start, err)
+		if err != nil {
+			return mcpToolError(err), StaticSettings{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "static routing retrieved"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "static_update_routing", Description: "Enable or disable a gateway-managed safe SPA fallback for a CloudPanel static site. Requires sites:write and the current revision."}, func(ctx context.Context, _ *mcp.CallToolRequest, in struct {
+		Domain          string `json:"domain"`
+		SPAFallback     bool   `json:"spa_fallback"`
+		IfMatchRevision string `json:"if_match_revision"`
+	}) (*mcp.CallToolResult, StaticSettings, error) {
+		if !HasScope(t, "sites:write") {
+			return mcpScopeError(), StaticSettings{}, nil
+		}
+		out := StaticSettings{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Static: &StaticRequest{Operation: staticUpdateRouting, Domain: in.Domain, SPAFallback: in.SPAFallback, IfMatchRevision: in.IfMatchRevision}}, &out)
+		a.auditMCP(t, "static.update_routing", start, err)
+		if err != nil {
+			return mcpToolError(err), StaticSettings{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "static routing updated"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "static_deploy_release", Description: "Deploy a managed ZIP artifact as a static site's active document root. It validates the site type and creates a mandatory safety backup. Requires files:write, local file.deploy_root policy, replace=true, and confirm=true."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpRootDeployInput) (*mcp.CallToolResult, DeploymentResult, error) {
+		if !HasScope(t, "files:write") {
+			return mcpScopeError(), DeploymentResult{}, nil
+		}
+		out := DeploymentResult{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Deploy: &DeployRequest{Domain: in.Domain, ArtifactID: in.ArtifactID, OwnerTokenID: t.ID, Root: true, Static: true, Replace: in.Replace, Confirm: in.Confirm}}, &out)
+		a.auditMCP(t, "static.deploy_release", start, err)
+		if err != nil {
+			return mcpToolError(err), DeploymentResult{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "static release deployed after safety backup"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "artifact_begin_upload", Description: "Begin a managed ZIP artifact upload. Supply the exact total number of base64 chunks (1-100), then use artifact_upload_chunk in order and artifact_complete_upload. Requires artifacts:write."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpArtifactBeginInput) (*mcp.CallToolResult, map[string]any, error) {
+		if !HasScope(t, "artifacts:write") {
+			return mcpScopeError(), nil, nil
+		}
+		out, e := a.beginArtifactUpload(t, in.TotalChunks)
+		if e != nil {
+			return mcpToolError(e), nil, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "artifact upload session created"}}}, map[string]any{"upload_id": out.ID, "max_chunk_bytes": maxArtifactChunk, "expires_at": out.ExpiresAt}, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "artifact_upload_chunk", Description: "Upload one sequential base64 ZIP chunk to a managed artifact session. Each decoded chunk is at most 1 MiB. Requires artifacts:write."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpArtifactChunkInput) (*mcp.CallToolResult, map[string]any, error) {
+		if !HasScope(t, "artifacts:write") {
+			return mcpScopeError(), nil, nil
+		}
+		if len(in.DataBase64) > base64.StdEncoding.EncodedLen(maxArtifactChunk) {
+			return mcpToolError(errors.New("base64 chunk exceeds 1 MiB decoded limit")), nil, nil
+		}
+		data, e := base64.StdEncoding.DecodeString(in.DataBase64)
+		if e != nil {
+			return mcpToolError(errors.New("invalid base64 chunk")), nil, nil
+		}
+		out, e := a.appendArtifactChunk(t, in.UploadID, in.Index, data)
+		if e != nil {
+			return mcpToolError(e), nil, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "artifact chunk stored"}}}, map[string]any{"upload_id": out.ID, "next_chunk": out.NextChunk, "size": out.Size}, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "artifact_complete_upload", Description: "Validate a completed managed ZIP upload, calculate its SHA-256 digest, and return the artifact_id for deployment. Requires artifacts:write."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpArtifactCompleteInput) (*mcp.CallToolResult, Artifact, error) {
+		if !HasScope(t, "artifacts:write") {
+			return mcpScopeError(), Artifact{}, nil
+		}
+		out, e := a.completeArtifactUpload(t, in.UploadID)
+		if e != nil {
+			return mcpToolError(e), Artifact{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "artifact upload completed"}}}, out, nil
+	})
+	nodeCall := func(ctx context.Context, scope string, operation string, in mcpNodeInput, out any) (*mcp.CallToolResult, error) {
+		if !HasScope(t, scope) {
+			return mcpScopeError(), nil
+		}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Node: &NodeRequest{Operation: operation, Domain: in.Domain, ArtifactID: in.ArtifactID, OwnerTokenID: t.ID, Framework: in.Framework, Entrypoint: in.Entrypoint, Args: in.Args, NodeVersion: in.NodeVersion, AppPort: in.AppPort, HealthPath: in.HealthPath, IfMatchRevision: in.IfMatchRevision, Confirm: in.Confirm}}, out)
+		a.auditMCP(t, "node."+operation, start, err)
+		if err != nil {
+			return mcpToolError(err), nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Node.js operation completed"}}}, nil
+	}
+	mcp.AddTool(s, &mcp.Tool{Name: "project_inspect_artifact", Description: "Read a token-owned source ZIP without executing it. Returns detected npm project characteristics and safe deployment modes. Requires artifacts:write."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpNodeInput) (*mcp.CallToolResult, ProjectInspection, error) {
+		if !HasScope(t, "artifacts:write") {
+			return mcpScopeError(), ProjectInspection{}, nil
+		}
+		out := ProjectInspection{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Node: &NodeRequest{Operation: nodeInspect, Domain: "project.invalid", ArtifactID: in.ArtifactID, OwnerTokenID: t.ID}}, &out)
+		a.auditMCP(t, "project.inspect_artifact", start, err)
+		if err != nil {
+			return mcpToolError(err), ProjectInspection{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "project inspected without execution"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "site_build_release", Description: "Policy-gated server-side npm build from a token-owned source ZIP. Requires node:build and local node.server_build policy; it runs fixed npm ci and npm run build in a restricted systemd sandbox."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpBuildInput) (*mcp.CallToolResult, BuildResult, error) {
+		if !HasScope(t, "node:build") {
+			return mcpScopeError(), BuildResult{}, nil
+		}
+		out := BuildResult{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Build: &BuildRequest{Domain: in.Domain, ArtifactID: in.ArtifactID, OwnerTokenID: t.ID, Framework: in.Framework, OutputDir: in.OutputDir}}, &out)
+		a.auditMCP(t, "node.server_build", start, err)
+		if err != nil {
+			return mcpToolError(err), BuildResult{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "server build completed"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "node_get_settings", Description: "Read CloudPanel Node.js version, loopback app port, active release, and revision. Requires node:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpNodeInput) (*mcp.CallToolResult, NodeSettings, error) {
+		out := NodeSettings{}
+		res, err := nodeCall(ctx, "node:read", nodeGetSettings, in, &out)
+		return res, out, err
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "node_update_settings", Description: "Change managed Node.js settings with the current revision and confirm=true. It never performs a build. Requires node:write and local node.runtime_manage policy."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpNodeInput) (*mcp.CallToolResult, NodeSettings, error) {
+		out := NodeSettings{}
+		res, err := nodeCall(ctx, "node:write", nodeUpdate, in, &out)
+		return res, out, err
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "node_get_status", Description: "Read generated systemd service status, restart count, active release, and loopback readiness. Requires node:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpNodeInput) (*mcp.CallToolResult, NodeStatus, error) {
+		out := NodeStatus{}
+		res, err := nodeCall(ctx, "node:read", nodeStatus, in, &out)
+		return res, out, err
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "node_restart", Description: "Restart the generated site-scoped Node.js systemd unit. Requires node:write, local node.runtime_manage policy, and confirm=true."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpNodeInput) (*mcp.CallToolResult, NodeStatus, error) {
+		out := NodeStatus{}
+		res, err := nodeCall(ctx, "node:write", nodeRestart, in, &out)
+		return res, out, err
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "node_deploy_release", Description: "Deploy a token-owned managed Node.js ZIP as an immutable release, atomically activate it, and start the hardened generated systemd service. Requires node:deploy and local node.deploy_release policy."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpNodeInput) (*mcp.CallToolResult, NodeStatus, error) {
+		out := NodeStatus{}
+		res, err := nodeCall(ctx, "node:deploy", nodeDeploy, in, &out)
+		return res, out, err
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "node_list_releases", Description: "List retained Node.js releases for a site. Requires node:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpNodeInput) (*mcp.CallToolResult, NodeReleaseList, error) {
+		out := NodeReleaseList{}
+		res, err := nodeCall(ctx, "node:read", nodeList, in, &out)
+		return res, out, err
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "node_rollback_release", Description: "Atomically reactivate the previous retained Node.js release. Requires node:deploy, local node.deploy_release policy, and confirm=true."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpNodeInput) (*mcp.CallToolResult, NodeStatus, error) {
+		out := NodeStatus{}
+		res, err := nodeCall(ctx, "node:deploy", nodeRollback, in, &out)
+		return res, out, err
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "site_backup_create", Description: "Create an encrypted, local managed backup of files, databases, or both. Database selection is derived from the CloudPanel site relation. Requires backups:write."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpBackupCreateInput) (*mcp.CallToolResult, BackupResult, error) {
+		if !HasScope(t, "backups:write") {
+			return mcpScopeError(), BackupResult{}, nil
+		}
+		out := BackupResult{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Backup: &BackupRequest{Operation: "create", Domain: in.Domain, Components: in.Components}}, &out)
+		a.auditMCP(t, "backup.create", start, err)
+		if err != nil {
+			return mcpToolError(err), BackupResult{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "encrypted backup created"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "site_backup_list", Description: "List encrypted local managed recovery backups for a site, including expiry and retention policy. Requires backups:read."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpSiteInput) (*mcp.CallToolResult, map[string]any, error) {
+		if !HasScope(t, "backups:read") {
+			return mcpScopeError(), map[string]any{}, nil
+		}
+		out := map[string]any{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Backup: &BackupRequest{Operation: "list", Domain: in.Domain}}, &out)
+		a.auditMCP(t, "backup.list", start, err)
+		if err != nil {
+			return mcpToolError(err), map[string]any{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "backups listed"}}}, out, nil
+	})
+	mcp.AddTool(s, &mcp.Tool{Name: "site_backup_restore", Description: "Restore selected files, databases, or both from a managed encrypted backup. A mandatory matching pre-restore safety backup is created first. Requires backups:write, locally enabled backup.restore policy, and confirm=true."}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpBackupRestoreInput) (*mcp.CallToolResult, BackupResult, error) {
+		if !HasScope(t, "backups:write") {
+			return mcpScopeError(), BackupResult{}, nil
+		}
+		out := BackupResult{}
+		start := time.Now()
+		err := CallTypedHelper(ctx, a.Config, HelperRequest{Backup: &BackupRequest{Operation: "restore", Domain: in.Domain, BackupID: in.BackupID, Components: in.Components, Confirm: in.Confirm}}, &out)
+		a.auditMCP(t, "backup.restore", start, err)
+		if err != nil {
+			return mcpToolError(err), BackupResult{}, nil
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "backup restored"}}}, out, nil
+	})
 	return s
+}
+
+func (a *APIServer) auditMCP(t *Token, action string, start time.Time, err error) {
+	outcome, detail := "ok", "operation completed"
+	if err != nil {
+		outcome, detail = "error", "operation failed"
+	}
+	a.State.Audit("mcp", t.ID, action, outcome, detail, time.Since(start))
 }
 
 func mcpScopeError() *mcp.CallToolResult {

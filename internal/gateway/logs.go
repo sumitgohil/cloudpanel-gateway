@@ -3,11 +3,13 @@ package gateway
 import (
 	"bufio"
 	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -199,6 +201,9 @@ func discoverSources(layout siteLayout, appPath string) ([]LogSource, error) {
 		}
 		out = append(out, sourceMetadata("app:"+rel, "app", path, rel)...)
 	}
+	if info, err := os.Stat(filepath.Join("/etc/systemd/system", nodeUnitName(layout.domain))); err == nil && info.Mode().IsRegular() {
+		out = append(out, LogSource{ID: "node_runtime", Kind: "node_runtime", Path: "journal:" + nodeUnitName(layout.domain), Modified: info.ModTime().UTC().Format(time.RFC3339)})
+	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].ID == out[j].ID {
 			return out[i].Path < out[j].Path
@@ -365,6 +370,13 @@ func readLogs(q LogRequest) (LogResult, error) {
 		statusSet[s] = true
 	}
 	for _, source := range selected {
+		if source.Kind == "node_runtime" {
+			lines, read, truncated := readNodeJournal(q.Domain, from, to, q.Contains, maxLogBytes-result.BytesRead)
+			result.Lines = append(result.Lines, lines...)
+			result.BytesRead += read
+			result.Truncated = result.Truncated || truncated
+			continue
+		}
 		base := sourceBase(layout, source)
 		if base == "" {
 			continue
@@ -404,6 +416,39 @@ func readLogs(q LogRequest) (LogResult, error) {
 	result.Signals = diagnoseLines(result.Lines)
 	result.DiagnosisNotice = "Signals are deterministic evidence only; use the returned lines and site context before applying a separate, explicit fix."
 	return result, nil
+}
+
+func readNodeJournal(domain string, from, to time.Time, contains string, budget int64) ([]LogLine, int64, bool) {
+	if budget <= 0 {
+		return nil, 0, true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "journalctl", "--no-pager", "--output=short-iso", "--unit="+nodeUnitName(domain), "--since="+from.Format(time.RFC3339), "--until="+to.Format(time.RFC3339))
+	pipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, 0, false
+	}
+	if err = cmd.Start(); err != nil {
+		return nil, 0, false
+	}
+	data, err := io.ReadAll(io.LimitReader(pipe, budget+1))
+	_ = cmd.Wait()
+	if err != nil {
+		return nil, 0, false
+	}
+	truncated := int64(len(data)) > budget
+	if truncated {
+		data = data[:budget]
+	}
+	var out []LogLine
+	for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
+		if line == "" || (contains != "" && !strings.Contains(strings.ToLower(line), strings.ToLower(contains))) {
+			continue
+		}
+		out = append(out, LogLine{Source: "node_runtime", Line: line})
+	}
+	return out, int64(len(data)), truncated
 }
 
 func sourceSelection(want []string, available []LogSource) []LogSource {

@@ -66,7 +66,7 @@ func NewRootCommand() *cobra.Command {
 		defer s.Close()
 		return ListenNginxCommit(cmd.Context(), c)
 	}})
-	root.AddCommand(bootstrapCmd(load), tokenCmd(load), policyCmd(load), domainCmd(load), settingsCmd(load), doctorCmd(load), serviceCmd(load), completionCmd(root))
+	root.AddCommand(bootstrapCmd(load), tokenCmd(load), policyCmd(load), domainCmd(load), settingsCmd(load), tlsCmd(load), fileCmd(load), backupCmd(load), cronCmd(load), nodeCmd(load), doctorCmd(load), serviceCmd(load), completionCmd(root))
 	root.AddCommand(&cobra.Command{Use: "version", Short: "Print version", Run: func(cmd *cobra.Command, args []string) { fmt.Fprintln(cmd.OutOrStdout(), Version) }})
 	return root
 }
@@ -220,10 +220,11 @@ func policyCmd(load stateLoader) *cobra.Command {
 				return e
 			}
 			spec, ok := Actions[op]
-			if !ok {
+			managed := op == "file.deploy_artifact" || op == "file.deploy_root" || op == "backup.restore" || op == "node.server_build" || op == "node.deploy_release" || op == "node.runtime_manage" || op == "cron.raw_command"
+			if !ok && !managed {
 				return errors.New("unknown operation")
 			}
-			if !spec.Dangerous {
+			if ok && !spec.Dangerous && !managed {
 				return errors.New("only dangerous operations are policy controlled")
 			}
 			_, s, e := load(false)
@@ -252,6 +253,10 @@ func policyCmd(load stateLoader) *cobra.Command {
 				v, _ := s.Allowed(n)
 				out[n] = v
 			}
+		}
+		for _, n := range []string{"file.deploy_artifact", "file.deploy_root", "backup.restore", "node.server_build", "node.deploy_release", "node.runtime_manage", "cron.raw_command"} {
+			v, _ := s.Allowed(n)
+			out[n] = v
 		}
 		return json.NewEncoder(cmd.OutOrStdout()).Encode(out)
 	}}
@@ -512,6 +517,184 @@ func settingsCmd(load stateLoader) *cobra.Command {
 	return cmd
 }
 
+func typedLocalCall(load stateLoader, cmd *cobra.Command, request HelperRequest) error {
+	if err := requireRoot(); err != nil {
+		return err
+	}
+	c, s, err := load(false)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	var out any
+	if err = CallTypedHelper(cmd.Context(), c, request, &out); err != nil {
+		return err
+	}
+	return json.NewEncoder(cmd.OutOrStdout()).Encode(out)
+}
+
+func tlsCmd(load stateLoader) *cobra.Command {
+	cmd := &cobra.Command{Use: "tls", Short: "Read active TLS certificate status without exposing key material"}
+	var domain string
+	status := &cobra.Command{Use: "status", Short: "Show issuer, expiry, SANs, consistency, and expiry-based renewal health", RunE: func(c *cobra.Command, args []string) error {
+		return typedLocalCall(load, c, HelperRequest{TLS: &TLSRequest{Domain: domain}})
+	}}
+	status.Flags().StringVar(&domain, "domain", "", "site domain")
+	_ = status.MarkFlagRequired("domain")
+	cmd.AddCommand(status)
+	return cmd
+}
+
+func fileCmd(load stateLoader) *cobra.Command {
+	cmd := &cobra.Command{Use: "file", Short: "Safely deploy managed artifacts"}
+	var domain, artifact, target string
+	var replace, confirm bool
+	deploy := &cobra.Command{Use: "deploy-artifact", Short: "Deploy a managed ZIP artifact to a site-root-relative directory", Example: "cloudpanel-gateway file deploy-artifact --domain example.com --artifact-id artifact_x --target-dir releases/current", RunE: func(c *cobra.Command, args []string) error {
+		return typedLocalCall(load, c, HelperRequest{Deploy: &DeployRequest{Domain: domain, ArtifactID: artifact, TargetDir: target, Replace: replace, Confirm: confirm}})
+	}}
+	deploy.Flags().StringVar(&domain, "domain", "", "site domain")
+	deploy.Flags().StringVar(&artifact, "artifact-id", "", "managed artifact ID")
+	deploy.Flags().StringVar(&target, "target-dir", "", "site-root-relative target directory")
+	deploy.Flags().BoolVar(&replace, "replace", false, "replace a non-empty target only with --confirm")
+	deploy.Flags().BoolVar(&confirm, "confirm", false, "confirm replacement")
+	_ = deploy.MarkFlagRequired("domain")
+	_ = deploy.MarkFlagRequired("artifact-id")
+	_ = deploy.MarkFlagRequired("target-dir")
+	var rootDomain, rootArtifact string
+	var rootReplace, rootConfirm bool
+	rootDeploy := &cobra.Command{Use: "deploy-root-artifact", Short: "Replace a site's active root after creating a mandatory safety backup", Example: "cloudpanel-gateway file deploy-root-artifact --domain example.com --artifact-id artifact_x --replace --confirm", RunE: func(c *cobra.Command, args []string) error {
+		return typedLocalCall(load, c, HelperRequest{Deploy: &DeployRequest{Domain: rootDomain, ArtifactID: rootArtifact, Replace: rootReplace, Confirm: rootConfirm, Root: true}})
+	}}
+	rootDeploy.Flags().StringVar(&rootDomain, "domain", "", "site domain")
+	rootDeploy.Flags().StringVar(&rootArtifact, "artifact-id", "", "managed artifact ID")
+	rootDeploy.Flags().BoolVar(&rootReplace, "replace", false, "required acknowledgement that the active root will be replaced")
+	rootDeploy.Flags().BoolVar(&rootConfirm, "confirm", false, "confirm root replacement")
+	_ = rootDeploy.MarkFlagRequired("domain")
+	_ = rootDeploy.MarkFlagRequired("artifact-id")
+	cmd.AddCommand(deploy, rootDeploy)
+	return cmd
+}
+
+func backupCmd(load stateLoader) *cobra.Command {
+	cmd := &cobra.Command{Use: "backup", Short: "Create, list, and restore encrypted managed site backups"}
+	var domain, components string
+	create := &cobra.Command{Use: "create", Short: "Create an encrypted local backup", RunE: func(c *cobra.Command, args []string) error {
+		return typedLocalCall(load, c, HelperRequest{Backup: &BackupRequest{Operation: "create", Domain: domain, Components: components}})
+	}}
+	create.Flags().StringVar(&domain, "domain", "", "site domain")
+	create.Flags().StringVar(&components, "components", "", "files, databases, or both")
+	_ = create.MarkFlagRequired("domain")
+	_ = create.MarkFlagRequired("components")
+	var listDomain string
+	list := &cobra.Command{Use: "list", Short: "List managed encrypted backups and retention", RunE: func(c *cobra.Command, args []string) error {
+		return typedLocalCall(load, c, HelperRequest{Backup: &BackupRequest{Operation: "list", Domain: listDomain}})
+	}}
+	list.Flags().StringVar(&listDomain, "domain", "", "site domain")
+	_ = list.MarkFlagRequired("domain")
+	var restoreDomain, backupID, restoreComponents string
+	var confirm bool
+	restore := &cobra.Command{Use: "restore", Short: "Restore selected components after a mandatory safety backup", RunE: func(c *cobra.Command, args []string) error {
+		return typedLocalCall(load, c, HelperRequest{Backup: &BackupRequest{Operation: "restore", Domain: restoreDomain, BackupID: backupID, Components: restoreComponents, Confirm: confirm}})
+	}}
+	restore.Flags().StringVar(&restoreDomain, "domain", "", "site domain")
+	restore.Flags().StringVar(&backupID, "backup-id", "", "managed backup ID")
+	restore.Flags().StringVar(&restoreComponents, "components", "", "files, databases, or both")
+	restore.Flags().BoolVar(&confirm, "confirm", false, "confirm restore")
+	_ = restore.MarkFlagRequired("domain")
+	_ = restore.MarkFlagRequired("backup-id")
+	_ = restore.MarkFlagRequired("components")
+	cmd.AddCommand(create, list, restore)
+	return cmd
+}
+
+func cronCmd(load stateLoader) *cobra.Command {
+	cmd := &cobra.Command{Use: "cron", Short: "Manage CloudPanel site cron jobs"}
+	var domain, revision, runner, target, method, url, raw string
+	var id int64
+	var minute, hour, day, month, weekday string
+	var args []string
+	var confirm bool
+	request := func(operation string) HelperRequest {
+		return HelperRequest{Cron: &CronRequest{Operation: operation, Domain: domain, JobID: id, Minute: minute, Hour: hour, Day: day, Month: month, Weekday: weekday, Runner: runner, Target: target, Args: args, Method: method, URL: url, RawCommand: raw, IfMatchRevision: revision, Confirm: confirm}}
+	}
+	list := &cobra.Command{Use: "list", Short: "List a site's CloudPanel-managed cron jobs and revision", RunE: func(c *cobra.Command, _ []string) error { return typedLocalCall(load, c, request(cronList)) }}
+	create := &cobra.Command{Use: "create", Short: "Create a typed or policy-gated raw site cron job", RunE: func(c *cobra.Command, _ []string) error { return typedLocalCall(load, c, request(cronCreate)) }}
+	update := &cobra.Command{Use: "update", Short: "Update a cron job using the current revision", RunE: func(c *cobra.Command, _ []string) error { return typedLocalCall(load, c, request(cronUpdate)) }}
+	deleteCmd := &cobra.Command{Use: "delete", Short: "Delete a cron job after explicit confirmation", RunE: func(c *cobra.Command, _ []string) error { return typedLocalCall(load, c, request(cronDelete)) }}
+	for _, c := range []*cobra.Command{list, create, update, deleteCmd} {
+		c.Flags().StringVar(&domain, "domain", "", "CloudPanel site domain")
+		_ = c.MarkFlagRequired("domain")
+	}
+	for _, c := range []*cobra.Command{create, update} {
+		c.Flags().StringVar(&minute, "minute", "", "cron minute field")
+		c.Flags().StringVar(&hour, "hour", "", "cron hour field")
+		c.Flags().StringVar(&day, "day", "", "cron day-of-month field")
+		c.Flags().StringVar(&month, "month", "", "cron month field")
+		c.Flags().StringVar(&weekday, "weekday", "", "cron weekday field")
+		c.Flags().StringVar(&runner, "runner", "", "php_script, node_script, site_executable, http_request, or raw_command")
+		c.Flags().StringVar(&target, "target", "", "site-root-relative script target")
+		c.Flags().StringSliceVar(&args, "arg", nil, "typed runner argument; repeatable")
+		c.Flags().StringVar(&method, "method", "GET", "HTTP runner method: GET or POST")
+		c.Flags().StringVar(&url, "url", "", "HTTPS URL for http_request runner")
+		c.Flags().StringVar(&raw, "raw-command", "", "single-line raw command; requires local cron.raw_command policy and --confirm")
+		for _, name := range []string{"minute", "hour", "day", "month", "weekday", "runner"} {
+			_ = c.MarkFlagRequired(name)
+		}
+	}
+	update.Flags().Int64Var(&id, "job-id", 0, "CloudPanel cron job ID")
+	update.Flags().StringVar(&revision, "if-match-revision", "", "revision from cron list")
+	_ = update.MarkFlagRequired("job-id")
+	_ = update.MarkFlagRequired("if-match-revision")
+	deleteCmd.Flags().Int64Var(&id, "job-id", 0, "CloudPanel cron job ID")
+	deleteCmd.Flags().StringVar(&revision, "if-match-revision", "", "revision from cron list")
+	deleteCmd.Flags().BoolVar(&confirm, "confirm", false, "confirm job deletion")
+	_ = deleteCmd.MarkFlagRequired("job-id")
+	_ = deleteCmd.MarkFlagRequired("if-match-revision")
+	create.Flags().StringVar(&revision, "if-match-revision", "", "revision from cron list")
+	create.Flags().BoolVar(&confirm, "confirm", false, "required only for raw_command")
+	_ = create.MarkFlagRequired("if-match-revision")
+	cmd.AddCommand(list, create, update, deleteCmd)
+	return cmd
+}
+
+func nodeCmd(load stateLoader) *cobra.Command {
+	cmd := &cobra.Command{Use: "node", Short: "Manage CloudPanel Node.js releases and generated systemd services"}
+	var domain, artifact, framework, entrypoint, version, health, revision string
+	var args []string
+	var port int
+	var confirm bool
+	call := func(operation string, c *cobra.Command) error {
+		return typedLocalCall(load, c, HelperRequest{Node: &NodeRequest{Operation: operation, Domain: domain, ArtifactID: artifact, Framework: framework, Entrypoint: entrypoint, Args: args, NodeVersion: version, AppPort: port, HealthPath: health, IfMatchRevision: revision, Confirm: confirm}})
+	}
+	get := &cobra.Command{Use: "settings", Short: "Show CloudPanel Node.js version, app port, and gateway revision", RunE: func(c *cobra.Command, _ []string) error { return call(nodeGetSettings, c) }}
+	status := &cobra.Command{Use: "status", Short: "Show generated service and loopback readiness", RunE: func(c *cobra.Command, _ []string) error { return call(nodeStatus, c) }}
+	update := &cobra.Command{Use: "update-settings", Short: "Update the managed runtime settings after an explicit confirmation", RunE: func(c *cobra.Command, _ []string) error { return call(nodeUpdate, c) }}
+	deploy := &cobra.Command{Use: "deploy-release", Short: "Deploy a managed Node.js ZIP artifact as an atomic release", RunE: func(c *cobra.Command, _ []string) error { return call(nodeDeploy, c) }}
+	restart := &cobra.Command{Use: "restart", Short: "Restart the generated Node.js service", RunE: func(c *cobra.Command, _ []string) error { return call(nodeRestart, c) }}
+	list := &cobra.Command{Use: "releases", Short: "List retained Node.js releases", RunE: func(c *cobra.Command, _ []string) error { return call(nodeList, c) }}
+	rollback := &cobra.Command{Use: "rollback", Short: "Activate the previous Node.js release", RunE: func(c *cobra.Command, _ []string) error { return call(nodeRollback, c) }}
+	for _, c := range []*cobra.Command{get, status, update, deploy, restart, list, rollback} {
+		c.Flags().StringVar(&domain, "domain", "", "CloudPanel Node.js domain")
+		_ = c.MarkFlagRequired("domain")
+	}
+	update.Flags().StringVar(&version, "node-version", "", "CloudPanel Node.js version")
+	update.Flags().IntVar(&port, "app-port", 0, "loopback application port")
+	update.Flags().StringVar(&health, "health-path", "", "optional HTTP health path")
+	update.Flags().StringVar(&revision, "if-match-revision", "", "current Node.js settings revision")
+	update.Flags().BoolVar(&confirm, "confirm", false, "confirm runtime change")
+	deploy.Flags().StringVar(&artifact, "artifact-id", "", "managed artifact ID")
+	deploy.Flags().StringVar(&framework, "framework", "generic-node", "generic-node, astro, next-standalone, or nuxt-node")
+	deploy.Flags().StringVar(&entrypoint, "entrypoint", "", "relative .js/.mjs/.cjs entrypoint")
+	deploy.Flags().StringSliceVar(&args, "arg", nil, "safe Node.js argument; repeat as needed")
+	deploy.Flags().StringVar(&health, "health-path", "", "optional HTTP health path")
+	_ = deploy.MarkFlagRequired("artifact-id")
+	_ = deploy.MarkFlagRequired("entrypoint")
+	restart.Flags().BoolVar(&confirm, "confirm", false, "confirm restart")
+	rollback.Flags().BoolVar(&confirm, "confirm", false, "confirm rollback")
+	cmd.AddCommand(get, status, update, deploy, restart, list, rollback)
+	return cmd
+}
+
 func parseSetValues(items []string) (map[string]string, error) {
 	out := map[string]string{}
 	for _, item := range items {
@@ -575,7 +758,10 @@ type httpServer struct {
 }
 
 func (s *httpServer) run(ctx context.Context) error {
-	srv := &http.Server{Addr: s.addr, Handler: s.handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 20 * time.Second, WriteTimeout: 95 * time.Second, IdleTimeout: 60 * time.Second}
+	// Deployments are bounded to 100 MiB and backups have a helper-enforced
+	// 15-minute ceiling. These timeouts keep those legitimate operations from
+	// being cut off while the request body and helper protocols stay bounded.
+	srv := &http.Server{Addr: s.addr, Handler: s.handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Minute, WriteTimeout: 16 * time.Minute, IdleTimeout: 60 * time.Second}
 	done := make(chan error, 1)
 	go func() { done <- srv.ListenAndServe() }()
 	select {

@@ -33,13 +33,17 @@ type Config struct {
 	Database           string   `json:"database"`
 	CloudPanelDatabase string   `json:"cloudpanel_database"`
 	ArtifactDir        string   `json:"artifact_dir"`
+	BackupDir          string   `json:"backup_dir"`
+	BackupKeyFile      string   `json:"backup_key_file"`
+	BuildDir           string   `json:"build_dir"`
+	CronDir            string   `json:"cron_dir"`
 	SecretFile         string   `json:"secret_file"`
 	HelperGID          int      `json:"helper_gid"`
 	AllowedHosts       []string `json:"allowed_hosts"`
 }
 
 func DefaultConfig() Config {
-	return Config{Listen: "127.0.0.1:9780", HelperSocket: "/run/cloudpanel-gateway/helper.sock", NginxCommitSocket: "/run/cloudpanel-gateway/nginx-commit.sock", Database: "/var/lib/cloudpanel-gateway/state.db", CloudPanelDatabase: "/home/clp/htdocs/app/data/db.sq3", ArtifactDir: "/var/lib/cloudpanel-gateway/artifacts", SecretFile: "/var/lib/cloudpanel-gateway/token-pepper"}
+	return Config{Listen: "127.0.0.1:9780", HelperSocket: "/run/cloudpanel-gateway/helper.sock", NginxCommitSocket: "/run/cloudpanel-gateway-nginx-commit/nginx-commit.sock", Database: "/var/lib/cloudpanel-gateway/state.db", CloudPanelDatabase: "/home/clp/htdocs/app/data/db.sq3", ArtifactDir: "/var/lib/cloudpanel-gateway/artifacts", BackupDir: "/var/lib/cloudpanel-gateway/backups", BackupKeyFile: "/var/lib/cloudpanel-gateway/backup-key", BuildDir: "/var/lib/cloudpanel-gateway/builds", CronDir: "/etc/cron.d", SecretFile: "/var/lib/cloudpanel-gateway/token-pepper"}
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -56,7 +60,7 @@ func LoadConfig(path string) (Config, error) {
 	for _, item := range []struct {
 		key string
 		dst *string
-	}{{"CPG_LISTEN", &c.Listen}, {"CPG_HELPER_SOCKET", &c.HelperSocket}, {"CPG_NGINX_COMMIT_SOCKET", &c.NginxCommitSocket}, {"CPG_DATABASE", &c.Database}, {"CPG_CLOUDPANEL_DATABASE", &c.CloudPanelDatabase}, {"CPG_ARTIFACT_DIR", &c.ArtifactDir}, {"CPG_SECRET_FILE", &c.SecretFile}} {
+	}{{"CPG_LISTEN", &c.Listen}, {"CPG_HELPER_SOCKET", &c.HelperSocket}, {"CPG_NGINX_COMMIT_SOCKET", &c.NginxCommitSocket}, {"CPG_DATABASE", &c.Database}, {"CPG_CLOUDPANEL_DATABASE", &c.CloudPanelDatabase}, {"CPG_ARTIFACT_DIR", &c.ArtifactDir}, {"CPG_BACKUP_DIR", &c.BackupDir}, {"CPG_BACKUP_KEY_FILE", &c.BackupKeyFile}, {"CPG_BUILD_DIR", &c.BuildDir}, {"CPG_CRON_DIR", &c.CronDir}, {"CPG_SECRET_FILE", &c.SecretFile}} {
 		if v := os.Getenv(item.key); v != "" {
 			*item.dst = v
 		}
@@ -114,7 +118,14 @@ func OpenState(c Config, createSecret bool) (*State, error) {
 CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, label TEXT NOT NULL, digest BLOB NOT NULL UNIQUE, scopes TEXT NOT NULL, expires_at TEXT, revoked_at TEXT, last_used_at TEXT, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS policy (operation TEXT PRIMARY KEY, enabled INTEGER NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS domains (domain TEXT PRIMARY KEY, site_user TEXT NOT NULL, secret BLOB NOT NULL, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT, token_id TEXT, action TEXT NOT NULL, outcome TEXT NOT NULL, detail TEXT, duration_ms INTEGER, created_at TEXT NOT NULL);`)
+CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT, token_id TEXT, action TEXT NOT NULL, outcome TEXT NOT NULL, detail TEXT, duration_ms INTEGER, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS artifacts (id TEXT PRIMARY KEY, path TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL, owner_token_id TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS artifact_uploads (id TEXT PRIMARY KEY, path TEXT NOT NULL, owner_token_id TEXT NOT NULL, size INTEGER NOT NULL, next_chunk INTEGER NOT NULL, total_chunks INTEGER NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS backups (id TEXT PRIMARY KEY, domain TEXT NOT NULL, components TEXT NOT NULL, databases TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, encrypted_size INTEGER NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, safety_backup_of TEXT);
+CREATE TABLE IF NOT EXISTS node_configs (domain TEXT PRIMARY KEY, unit_name TEXT NOT NULL, node_version TEXT NOT NULL, app_port INTEGER NOT NULL, entrypoint TEXT NOT NULL, args TEXT NOT NULL, health_path TEXT, active_release_id TEXT, previous_release_id TEXT, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS node_releases (id TEXT PRIMARY KEY, domain TEXT NOT NULL, artifact_id TEXT NOT NULL, sha256 TEXT NOT NULL, framework TEXT NOT NULL, entrypoint TEXT NOT NULL, path TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, activated_at TEXT);
+CREATE TABLE IF NOT EXISTS builds (id TEXT PRIMARY KEY, domain TEXT NOT NULL, source_artifact_id TEXT NOT NULL, mode TEXT NOT NULL, framework TEXT NOT NULL, output_artifact_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT);
+CREATE TABLE IF NOT EXISTS cron_metadata (job_id INTEGER PRIMARY KEY, domain TEXT NOT NULL, runner TEXT NOT NULL, target TEXT NOT NULL, updated_at TEXT NOT NULL);`)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -155,7 +166,7 @@ func ParseScopes(csv string) ([]string, error) {
 	return out, nil
 }
 
-var scopeRE = regexp.MustCompile(`^(admin|[a-z][a-z0-9-]*:(read|write|admin|purge|permissions|transfer))$`)
+var scopeRE = regexp.MustCompile(`^(admin|[a-z][a-z0-9-]*:(read|write|admin|purge|permissions|transfer|deploy|build))$`)
 
 func (s *State) CreateToken(label string, scopes []string, expires *time.Time) (Token, string, error) {
 	if len(label) < 1 || len(label) > 80 {
@@ -418,6 +429,13 @@ type HelperRequest struct {
 	Args     map[string]string `json:"args"`
 	Log      *LogRequest       `json:"log,omitempty"`
 	Settings *SettingsRequest  `json:"settings,omitempty"`
+	TLS      *TLSRequest       `json:"tls,omitempty"`
+	Deploy   *DeployRequest    `json:"deploy,omitempty"`
+	Backup   *BackupRequest    `json:"backup,omitempty"`
+	Node     *NodeRequest      `json:"node,omitempty"`
+	Build    *BuildRequest     `json:"build,omitempty"`
+	Static   *StaticRequest    `json:"static,omitempty"`
+	Cron     *CronRequest      `json:"cron,omitempty"`
 }
 type HelperResponse struct {
 	OK       bool            `json:"ok"`
@@ -459,6 +477,83 @@ func Execute(ctx context.Context, c Config, s *State, req HelperRequest) HelperR
 		data, err := json.Marshal(value)
 		if err != nil {
 			return HelperResponse{Error: "encode settings result"}
+		}
+		return HelperResponse{OK: true, Data: data}
+	}
+	if req.TLS != nil {
+		value, err := inspectTLS(c, *req.TLS)
+		if err != nil {
+			return HelperResponse{Error: err.Error()}
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			return HelperResponse{Error: "encode TLS result"}
+		}
+		return HelperResponse{OK: true, Data: data}
+	}
+	if req.Deploy != nil {
+		value, err := deployArtifact(ctx, c, s, *req.Deploy)
+		if err != nil {
+			return HelperResponse{Error: err.Error()}
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			return HelperResponse{Error: "encode deployment result"}
+		}
+		return HelperResponse{OK: true, Data: data}
+	}
+	if req.Backup != nil {
+		value, err := executeBackup(ctx, c, s, *req.Backup)
+		if err != nil {
+			return HelperResponse{Error: err.Error()}
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			return HelperResponse{Error: "encode backup result"}
+		}
+		return HelperResponse{OK: true, Data: data}
+	}
+	if req.Node != nil {
+		value, err := executeNode(ctx, c, s, *req.Node)
+		if err != nil {
+			return HelperResponse{Error: err.Error()}
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			return HelperResponse{Error: "encode node result"}
+		}
+		return HelperResponse{OK: true, Data: data}
+	}
+	if req.Build != nil {
+		value, err := executeBuild(ctx, c, s, *req.Build)
+		if err != nil {
+			return HelperResponse{Error: err.Error()}
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			return HelperResponse{Error: "encode build result"}
+		}
+		return HelperResponse{OK: true, Data: data}
+	}
+	if req.Static != nil {
+		value, err := executeStatic(ctx, c, s, *req.Static)
+		if err != nil {
+			return HelperResponse{Error: err.Error()}
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			return HelperResponse{Error: "encode static result"}
+		}
+		return HelperResponse{OK: true, Data: data}
+	}
+	if req.Cron != nil {
+		value, err := executeCron(ctx, c, s, *req.Cron)
+		if err != nil {
+			return HelperResponse{Error: err.Error()}
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			return HelperResponse{Error: "encode cron result"}
 		}
 		return HelperResponse{OK: true, Data: data}
 	}
@@ -540,7 +635,11 @@ func ListenHelper(ctx context.Context, c Config, s *State) error {
 			if json.NewDecoder(io.LimitReader(conn, 1<<20)).Decode(&req) != nil {
 				return
 			}
-			callCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+			timeout := 90 * time.Second
+			if req.Backup != nil {
+				timeout = 15 * time.Minute
+			}
+			callCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			_ = json.NewEncoder(conn).Encode(Execute(callCtx, c, s, req))
 		}()
@@ -621,6 +720,27 @@ func CallSettingsHelper(ctx context.Context, c Config, request SettingsRequest, 
 	}
 	var response HelperResponse
 	if err = json.NewDecoder(io.LimitReader(conn, 12<<20)).Decode(&response); err != nil {
+		return err
+	}
+	if !response.OK {
+		return errors.New(response.Error)
+	}
+	return json.Unmarshal(response.Data, out)
+}
+
+func CallTypedHelper(ctx context.Context, c Config, request HelperRequest, out any) error {
+	d := net.Dialer{Timeout: 5 * time.Second}
+	conn, err := d.DialContext(ctx, "unix", c.HelperSocket)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	request.Version = ProtocolVersion
+	if err = json.NewEncoder(conn).Encode(request); err != nil {
+		return err
+	}
+	var response HelperResponse
+	if err = json.NewDecoder(io.LimitReader(conn, 16<<20)).Decode(&response); err != nil {
 		return err
 	}
 	if !response.OK {

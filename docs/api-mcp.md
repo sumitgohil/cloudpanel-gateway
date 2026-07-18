@@ -14,6 +14,9 @@ TLS-enabled CloudPanel reverse proxy first.
 | `POST /v1/sites` | `sites:write` |
 | `POST /v1/actions/{action}` | Action-specific scope |
 | `POST /v1/artifacts` | `artifacts:write` |
+| `POST /v1/artifacts/uploads/begin` | `artifacts:write` |
+| `POST /v1/artifacts/uploads/{upload_id}/chunk` | `artifacts:write` |
+| `POST /v1/artifacts/uploads/{upload_id}/complete` | `artifacts:write` |
 | `GET /v1/sites/{domain}/logs/sources` | `logs:read` |
 | `POST /v1/sites/{domain}/logs/query` | `logs:read` (`raw` needs `admin`) |
 | `POST /v1/sites/{domain}/logs/diagnose` | `logs:read` |
@@ -23,6 +26,11 @@ TLS-enabled CloudPanel reverse proxy first.
 | `GET` / `PATCH /v1/sites/{domain}/php` | `php:read` / `php:write` |
 | `GET` / `PATCH /v1/sites/{domain}/pagespeed` | `pagespeed:read` / `pagespeed:write` |
 | `POST /v1/sites/{domain}/pagespeed/purge` | `cache:purge` |
+| `GET /v1/sites/{domain}/tls` | `tls:read` |
+| `POST /v1/sites/{domain}/deployments` | `files:write` + `file.deploy_artifact` policy |
+| `POST /v1/sites/{domain}/deployments/root` | `files:write` + `file.deploy_root` policy + `replace:true` + `confirm:true` |
+| `GET` / `POST /v1/sites/{domain}/backups` | `backups:read` / `backups:write` |
+| `POST /v1/sites/{domain}/backups/{backup_id}/restore` | `backups:write` + `backup.restore` policy + `confirm:true` |
 
 Example:
 
@@ -73,6 +81,11 @@ provides these named tools:
 - `php_get_settings`, `php_update_settings`
 - `pagespeed_get_settings`, `pagespeed_update_settings`,
   `pagespeed_purge_cache`
+- `tls_get_status`
+- `file_deploy_artifact`
+- `artifact_begin_upload`, `artifact_upload_chunk`, `artifact_complete_upload`
+- `site_deploy_root_artifact`
+- `site_backup_create`, `site_backup_list`, `site_backup_restore`
 
 Tools return structured JSON. A log diagnosis offers deterministic evidence
 such as HTTP error rates, upstream failures, PHP fatal/timeout/memory errors,
@@ -85,3 +98,66 @@ Database transfer, manual certificate, and vhost-template file inputs must be
 created through `POST /v1/artifacts`. The gateway stores them in a restricted
 directory and expires them after one hour. User-supplied absolute file paths,
 shell snippets, and arbitrary Nginx/PHP/PageSpeed directives are rejected.
+
+ZIP deployments use the same managed artifact flow, but accept only validated
+ZIP archives up to 100 MiB compressed. Archive traversal, duplicate entries,
+symlinks, devices, and excessive expansion are rejected. The target directory
+must be relative to the resolved site root; replacing non-empty content needs
+both `replace:true` and `confirm:true`.
+
+MCP clients can upload local archives without a shell or external URL by using
+the three upload tools. Begin the upload with its exact number of chunks, send
+sequential base64 chunks of at most 1 MiB, then complete it to receive the
+short-lived `artifact_id`. Upload sessions and artifacts are token-owned and
+expire after one hour.
+
+`site_deploy_root_artifact` is intentionally separate from directory
+deployment. It requires the `file.deploy_root` local policy and both
+`replace:true` and `confirm:true`; before the atomic root-directory swap, the
+root helper creates an encrypted files safety backup.
+
+## TLS and backups
+
+`tls_get_status` reports the active leaf certificate's issuer, subject, serial,
+expiry, SANs, vhost/CloudPanel-record consistency, and an expiry-based
+`renewal_health`. It deliberately does not claim that a renewal job succeeded,
+because CloudPanel has no reliable renewal-history primitive.
+
+Backups are encrypted local recovery objects, not network downloads. They can
+contain files, CloudPanel-related databases, or both. They expire after seven
+days and share a 10 GiB retention quota. Restore always creates a matching
+pre-restore safety backup first, then requires explicit confirmation and the
+local `backup.restore` policy.
+
+## Static and Node.js releases
+
+Static sites add `static_get_settings`, `static_update_routing`, and
+`static_deploy_release`. The routing tool only edits its own managed SPA
+fallback block and uses the Nginx validation/commit service.
+
+Node.js adds `project_inspect_artifact`, `site_build_release`,
+`node_get_settings`, `node_update_settings`, `node_get_status`,
+`node_restart`, `node_deploy_release`, `node_list_releases`, and
+`node_rollback_release`. Node releases use `node:read`, `node:write`,
+`node:deploy`, and `node:build` scopes as appropriate. Server builds require
+the locally enabled `node.server_build` policy; activation requires
+`node.deploy_release`; runtime changes and restarts require
+`node.runtime_manage`.
+
+The REST equivalents are `POST /v1/projects/inspect`,
+`POST /v1/sites/{domain}/builds`, `GET|PATCH /v1/sites/{domain}/node`,
+`GET /v1/sites/{domain}/node/status`, `POST /v1/sites/{domain}/node/restart`,
+`GET|POST /v1/sites/{domain}/node/releases`,
+`POST /v1/sites/{domain}/node/rollback`, and
+`GET|PATCH /v1/sites/{domain}/static` plus
+`POST /v1/sites/{domain}/static/deploy`.
+
+## Site cron jobs
+
+`cron_list`, `cron_create`, `cron_update`, and `cron_delete` manage
+CloudPanel's persisted site cron jobs. REST equivalents are
+`GET|POST /v1/sites/{domain}/cron-jobs` and
+`PATCH|DELETE /v1/sites/{domain}/cron-jobs/{job_id}`. Reads require
+`cron:read`; mutations require `cron:write` and the current revision. Deletion
+requires `confirm=true`. Typed runners are preferred; `raw_command` requires
+the root-only `cron.raw_command` policy and explicit confirmation.
