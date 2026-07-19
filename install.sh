@@ -137,5 +137,23 @@ chown root:cloudpanel-gateway /var/lib/cloudpanel-gateway/token-pepper
 chmod 0640 /var/lib/cloudpanel-gateway/token-pepper
 systemctl daemon-reload
 systemctl enable --now cloudpanel-gateway-nginx-commit.service cloudpanel-gateway-helper.service cloudpanel-gateway.service
-curl --fail --silent --show-error http://127.0.0.1:9780/readyz >/dev/null
+ready=false
+for _ in {1..20}; do
+  if systemctl is-active --quiet cloudpanel-gateway-nginx-commit.service \
+    && systemctl is-active --quiet cloudpanel-gateway-helper.service \
+    && systemctl is-active --quiet cloudpanel-gateway.service \
+    && curl --fail --silent http://127.0.0.1:9780/readyz >/dev/null 2>&1; then
+    ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$ready" != true ]]; then
+  echo "CloudPanel Gateway services did not become ready." >&2
+  systemctl --no-pager --full status \
+    cloudpanel-gateway-nginx-commit.service \
+    cloudpanel-gateway-helper.service \
+    cloudpanel-gateway.service >&2 || true
+  exit 1
+fi
 echo "Installed CloudPanel Gateway. Read the one-time bootstrap token in /root/cloudpanel-gateway-bootstrap-token.txt."
