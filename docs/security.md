@@ -1,7 +1,10 @@
 # Security model
 
-CloudPanel Gateway is a privileged integration. Treat its bearer tokens as
-production credentials and deploy it behind TLS on a trusted hostname.
+CloudPanel Gateway is a privileged automation control plane. Treat its bearer
+tokens as production credentials and deploy it behind TLS on a trusted
+hostname. It deliberately couples CloudPanel compatibility operations with
+gateway-native deployment, diagnostic, recovery, runtime, and scheduling
+workflows behind the same least-privilege boundary.
 
 ## Privilege separation
 

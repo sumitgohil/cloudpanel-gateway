@@ -84,6 +84,12 @@ jobs:
         with:
           path: release
           merge-multiple: true
+      - name: Package verified installer assets
+        run: |
+          cp install.sh release/cloudpanel-gateway-install.sh
+          cp deploy/systemd/cloudpanel-gateway-helper.service release/
+          cp deploy/systemd/cloudpanel-gateway-nginx-commit.service release/
+          cp deploy/systemd/cloudpanel-gateway.service release/
       - name: Install Minisign
         run: |
           sudo apt-get update
@@ -100,8 +106,19 @@ jobs:
             echo 'MINISIGN_SECRET_KEY must decode to a Minisign secret key file' >&2
             exit 1
           fi
-          sha256sum cloudpanel-gateway_*_linux_* > SHA256SUMS
-          for asset in cloudpanel-gateway_*_linux_* SHA256SUMS; do
+          sha256sum \
+            cloudpanel-gateway_*_linux_* \
+            cloudpanel-gateway-install.sh \
+            cloudpanel-gateway-helper.service \
+            cloudpanel-gateway-nginx-commit.service \
+            cloudpanel-gateway.service > SHA256SUMS
+          for asset in \
+            cloudpanel-gateway_*_linux_* \
+            cloudpanel-gateway-install.sh \
+            cloudpanel-gateway-helper.service \
+            cloudpanel-gateway-nginx-commit.service \
+            cloudpanel-gateway.service \
+            SHA256SUMS; do
             minisign -S -W -s minisign.key -m "$asset" -x "$asset.minisig"
           done
           rm -f minisign.key

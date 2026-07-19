@@ -1,5 +1,23 @@
 # REST API and MCP
 
+CloudPanel Gateway exposes a secure automation control plane through two
+network interfaces backed by the same scoped-token, policy, audit, and typed
+root-helper model. CloudPanel's `clpctl` surface is one compatibility adapter;
+the gateway also supplies operational capabilities such as site diagnostics,
+release delivery, Node runtime lifecycle management, backups, and cron jobs.
+
+## Automation interfaces
+
+- **REST API** is intended for platform services, deployment pipelines, and
+  conventional integrations.
+- **MCP** is the AI-native interface. Agents discover typed tools and receive
+  structured results instead of parsing terminal output.
+- **Local CLI** is intentionally separate and root-only. It bootstraps tokens,
+  maps gateway domains, and enables or disables server-wide policy gates.
+
+Neither REST nor MCP is a remote shell. Every operation has a fixed schema,
+validation rules, scope requirement, timeout, and redacted audit event.
+
 The public gateway uses bearer authentication for every endpoint except
 `/healthz` and `/readyz`. Do not expose the loopback listener directly; map a
 TLS-enabled CloudPanel reverse proxy first.
@@ -44,7 +62,7 @@ The OpenAPI document on the running service is authoritative for JSON request
 and response schemas. Responses include an `X-Request-ID`; include one in a
 support request when reporting an issue.
 
-## Typed CloudPanel actions
+## CloudPanel compatibility actions
 
 `POST /v1/actions/{action}` takes a JSON object with an `args` map. Only the
 following actions are accepted: `cloudflare.update_ips`, CloudPanel basic-auth
@@ -55,7 +73,9 @@ vhost-template management, and Varnish purge.
 
 The complete, version-specific action names, fields, and policy requirements
 are exposed through `/openapi.json` and MCP tool discovery. There is no
-arbitrary `clpctl` endpoint.
+arbitrary `clpctl` endpoint. These actions are complemented by gateway-native
+tools for logs, settings transactions, artifact delivery, backup, application
+runtime, and cron workflows.
 
 ## MCP
 
@@ -69,8 +89,8 @@ url = "https://panel.example.com/mcp"
 bearer_token_env_var = "CLOUDPANEL_GATEWAY_TOKEN"
 ```
 
-In addition to a typed MCP tool for each allowed CloudPanel action, the gateway
-provides these named tools:
+In addition to a typed MCP tool for each allowed CloudPanel compatibility
+action, the gateway provides these named operational tools:
 
 - `cloudpanel_site_logs_list_sources`
 - `cloudpanel_site_logs_query`

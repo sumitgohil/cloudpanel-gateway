@@ -1,7 +1,9 @@
 # Installation
 
-CloudPanel Gateway supports Ubuntu 24.04 hosts with CloudPanel and `clpctl`
-already installed. Installation must be run as root on the CloudPanel server.
+CloudPanel Gateway installs a secure automation control plane alongside a
+supported CloudPanel host. CloudPanel and `clpctl` must already be installed;
+the gateway adds scoped REST, MCP, and local-CLI automation without exposing a
+remote shell. Installation must be run as root on the CloudPanel server.
 
 ## What the installer does
 
@@ -25,8 +27,24 @@ administrator actions after installation.
 
 ## Production install
 
-Use a checked-out release so the install script has the matching systemd unit
-files. Replace the release below with the version you want to install.
+Use the release-pinned installer for a normal production installation. Replace
+`<release-version>` once with the version you intend to install.
+
+```bash
+VERSION=<release-version>; DIR="$(mktemp -d)"; curl --fail --location --proto '=https' --tlsv1.2 -o "$DIR/cloudpanel-gateway-install.sh" "https://github.com/sumitgohil/cloudpanel-gateway/releases/download/v${VERSION}/cloudpanel-gateway-install.sh" && curl --fail --location --proto '=https' --tlsv1.2 -o "$DIR/cloudpanel-gateway-install.sh.minisig" "https://github.com/sumitgohil/cloudpanel-gateway/releases/download/v${VERSION}/cloudpanel-gateway-install.sh.minisig" && sudo apt-get update && sudo apt-get install --yes --no-install-recommends minisign && minisign -Vm "$DIR/cloudpanel-gateway-install.sh" -P 'RWSc0fp65r6GcJiRAcydy1W60Jk8kvusaJyijgESv0WLwPaEd15sohP/' && sudo bash "$DIR/cloudpanel-gateway-install.sh" --version "${VERSION}"
+```
+
+The command verifies the installer before executing it. The installer then
+independently verifies itself (when invoked under its release asset name), the
+architecture-specific binary, and each systemd unit against the signed
+`SHA256SUMS` manifest before it installs gateway files or starts a service.
+This standalone installer is available from the first release that publishes
+`cloudpanel-gateway-install.sh`.
+
+### Checked-out release alternative
+
+You can also install from a checked-out tag. This is useful for review or when
+using an earlier release that did not publish the standalone installer.
 
 ```bash
 sudo apt-get update
