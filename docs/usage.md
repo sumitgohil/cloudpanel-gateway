@@ -9,6 +9,19 @@ sudo cloudpanel-gateway --help
 sudo cloudpanel-gateway <command> --help
 ```
 
+## Operating model
+
+CloudPanel Gateway is a secure automation control plane, not a remote shell.
+CloudPanel continues to own hosting configuration and runtime support; gateway
+exposes a typed compatibility layer for that administration and adds its own
+controlled workflows for diagnostics, artifacts and releases, Node services,
+backups, and cron jobs.
+
+The public REST and MCP interfaces run with least privilege. This local CLI is
+the administrator boundary: use it to create client tokens and to explicitly
+enable the few operations that are unsafe to make generally available. A token
+with `admin` still cannot bypass a disabled local policy.
+
 ## Tokens and scopes
 
 Tokens are opaque `cp_live_...` values. Only a keyed digest and token metadata
