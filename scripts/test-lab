@@ -79,7 +79,9 @@ machine_running() {
 }
 
 check_private_ip() {
-  machine_running && return 0
+  if machine_running; then
+    return 0
+  fi
   case "$(uname -s)" in
     Darwin) ping -c 1 -W 1000 "$lab_ip" >/dev/null 2>&1 && { echo "private IP is already in use: $lab_ip" >&2; exit 1; } ;;
     Linux) ping -c 1 -W 1 "$lab_ip" >/dev/null 2>&1 && { echo "private IP is already in use: $lab_ip" >&2; exit 1; } ;;
