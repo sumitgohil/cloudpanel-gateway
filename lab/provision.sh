@@ -134,7 +134,7 @@ main() {
   install_cloudpanel
   wait_for "CloudPanel CLI" command -v clpctl
   wait_for "Nginx" systemctl is-active --quiet nginx
-  wait_for "CloudPanel UI" curl --fail --silent --insecure https://127.0.0.1:8443/
+  wait_for "CloudPanel UI" curl --fail --silent --insecure --output /dev/null https://127.0.0.1:8443/
   create_cloudpanel_admin
 
   install_go
