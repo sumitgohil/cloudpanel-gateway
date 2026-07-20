@@ -94,7 +94,10 @@ build_and_install_gateway() {
     echo "source archive is not a CloudPanel Gateway checkout" >&2
     exit 1
   }
-  PATH=/usr/local/go/bin:$PATH CGO_ENABLED=0 go build -trimpath -o "$binary_path" "$source_dir/cmd/cloudpanel-gateway"
+  (
+    cd "$source_dir"
+    PATH=/usr/local/go/bin:$PATH CGO_ENABLED=0 go build -trimpath -o "$binary_path" ./cmd/cloudpanel-gateway
+  )
   chmod 0755 "$binary_path"
   "$source_dir/install.sh" --local-binary "$binary_path"
 }
