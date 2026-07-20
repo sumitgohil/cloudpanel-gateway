@@ -87,6 +87,7 @@ check_private_ip() {
     Linux) ping -c 1 -W 1 "$lab_ip" >/dev/null 2>&1 && { echo "private IP is already in use: $lab_ip" >&2; exit 1; } ;;
     MINGW*|MSYS*) ping -n 1 -w 1000 "$lab_ip" >/dev/null 2>&1 && { echo "private IP is already in use: $lab_ip" >&2; exit 1; } ;;
   esac
+  return 0
 }
 
 preflight() {
