@@ -1,0 +1,20 @@
+name: Local VM test lab
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Provision full CloudPanel VM
+    runs-on: [self-hosted, linux, virtualization]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create and verify test lab
+        run: ./scripts/test-lab up && ./scripts/test-lab verify
+      - name: Destroy test lab
+        if: always()
+        run: ./scripts/test-lab destroy

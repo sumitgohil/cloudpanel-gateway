@@ -80,6 +80,19 @@ root access, and an FQDN that resolves to the server.
 See [installation](docs/installation.md), [usage](docs/usage.md), and
 [REST and MCP](docs/api-mcp.md) for the complete guide.
 
+## Try a disposable local lab
+
+To evaluate CloudPanel Gateway without an existing CloudPanel host, use the
+Vagrant-based full-VM lab:
+
+```bash
+./scripts/test-lab up
+```
+
+It installs CloudPanel and Gateway from the current committed checkout on a
+private test VM, then prints generated credentials and the host-file entry for
+`gateway.cpgw.test`. See [local test-lab instructions](docs/test-lab.md).
+
 ## What CloudPanel Gateway is
 
 CloudPanel remains the hosting platform: it owns sites, users, TLS, Nginx, and

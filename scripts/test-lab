@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly root_dir
+readonly lab_dir="$root_dir/lab"
+readonly build_dir="$lab_dir/.build"
+readonly source_archive="$build_dir/source.tar"
+
+# shellcheck disable=SC1091
+source "$lab_dir/versions.env"
+lab_ip="${CPGW_LAB_IP:-$LAB_IP}"
+provider="${CPGW_PROVIDER:-virtualbox}"
+
+usage() {
+  cat <<'EOF'
+Usage: ./scripts/test-lab <command>
+
+Commands:
+  up          Create or provision the local CloudPanel Gateway VM, then show access details.
+  info        Print generated CloudPanel and Gateway credentials from the root-only guest file.
+  hosts       Print the hosts-file entry required to use the mapped Gateway domain.
+  verify      Run guest acceptance checks without reprovisioning.
+  provision   Rebuild the committed source archive and reprovision the existing VM.
+  ssh         Open an SSH session to the VM.
+  destroy     Permanently destroy the local test VM.
+
+Environment:
+  CPGW_LAB_IP       Override the default private IP (192.168.56.56).
+  CPGW_PROVIDER     Vagrant provider; defaults to virtualbox.
+EOF
+}
+
+run_vagrant() {
+  (cd "$root_dir" && CPGW_LAB_IP="$lab_ip" CPGW_LAB_SOURCE_ARCHIVE="$source_archive" VAGRANT_DEFAULT_PROVIDER="$provider" vagrant "$@")
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || { echo "required command is missing: $1" >&2; exit 1; }
+}
+
+require_supported_versions() {
+  local vagrant_version virtualbox_version
+  vagrant_version="$(vagrant --version | awk '{print $2}')"
+  [[ "$vagrant_version" =~ ^2\.([4-9]|[1-9][0-9]+)\. ]] || {
+    echo "Vagrant 2.4 or newer is required (found ${vagrant_version:-unknown})" >&2
+    exit 1
+  }
+  if [[ "$provider" == virtualbox ]]; then
+    virtualbox_version="$(VBoxManage --version)"
+    [[ "$virtualbox_version" =~ ^7\. ]] || {
+      echo "VirtualBox 7.x is required (found ${virtualbox_version:-unknown})" >&2
+      exit 1
+    }
+  fi
+}
+
+check_host_resources() {
+  local available_kb memory_bytes
+  available_kb="$(df -Pk "$root_dir" | awk 'NR == 2 { print $4 }')"
+  if [[ ! "${available_kb:-0}" =~ ^[0-9]+$ ]] || (( available_kb < 25 * 1024 * 1024 )); then
+    echo "at least 25 GiB of free disk space is required for the test lab" >&2
+    exit 1
+  fi
+  case "$(uname -s)" in
+    Darwin) memory_bytes="$(sysctl -n hw.memsize)" ;;
+    Linux) memory_bytes="$(awk '/MemTotal:/ { print $2 * 1024 }' /proc/meminfo)" ;;
+    MINGW*|MSYS*) memory_bytes="$(powershell.exe -NoProfile -Command '(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory' | tr -d '\r')" ;;
+    *) memory_bytes=0 ;;
+  esac
+  if [[ ! "${memory_bytes:-0}" =~ ^[0-9]+$ ]] || (( memory_bytes < 8 * 1024 * 1024 * 1024 )); then
+    echo "at least 8 GiB of host memory is required for the 4 GiB test VM" >&2
+    exit 1
+  fi
+}
+
+machine_running() {
+  run_vagrant status --machine-readable 2>/dev/null | awk -F, '$3 == "state" && $4 == "running" { found=1 } END { exit !found }'
+}
+
+check_private_ip() {
+  machine_running && return 0
+  case "$(uname -s)" in
+    Darwin) ping -c 1 -W 1000 "$lab_ip" >/dev/null 2>&1 && { echo "private IP is already in use: $lab_ip" >&2; exit 1; } ;;
+    Linux) ping -c 1 -W 1 "$lab_ip" >/dev/null 2>&1 && { echo "private IP is already in use: $lab_ip" >&2; exit 1; } ;;
+    MINGW*|MSYS*) ping -n 1 -w 1000 "$lab_ip" >/dev/null 2>&1 && { echo "private IP is already in use: $lab_ip" >&2; exit 1; } ;;
+  esac
+}
+
+preflight() {
+  require_command git
+  require_command tar
+  require_command vagrant
+  if [[ "$provider" == virtualbox ]]; then
+    require_command VBoxManage
+  fi
+  require_supported_versions
+  git -C "$root_dir" rev-parse --verify HEAD >/dev/null
+  if [[ -n "$(git -C "$root_dir" status --porcelain --untracked-files=no)" ]]; then
+    echo "commit or stash tracked changes before creating a reproducible test-lab source archive" >&2
+    exit 1
+  fi
+  check_host_resources
+  check_private_ip
+}
+
+package_source() {
+  mkdir -p "$build_dir"
+  git -C "$root_dir" archive --format=tar --output="$source_archive" HEAD
+  tar -tf "$source_archive" | grep -qx 'install.sh' || { echo "source archive is missing install.sh" >&2; exit 1; }
+}
+
+show_hosts() {
+  printf '%s %s\n' "$lab_ip" "$LAB_DOMAIN"
+}
+
+show_info() {
+  run_vagrant ssh -c 'sudo cat /root/cloudpanel-gateway-test-lab/access.json'
+  printf '\nAdd this host entry manually (the launcher never edits your host):\n  '
+  show_hosts
+  printf '\nCloudPanel uses a local certificate; accept the browser warning at https://%s:8443.\n' "$lab_ip"
+}
+
+case "${1:-}" in
+  up)
+    preflight
+    package_source
+    run_vagrant up --provision
+    show_info
+    ;;
+  provision)
+    preflight
+    package_source
+    run_vagrant provision
+    show_info
+    ;;
+  info) show_info ;;
+  hosts) show_hosts ;;
+  verify) run_vagrant ssh -c 'sudo /usr/local/lib/cloudpanel-gateway-test-lab/verify.sh' ;;
+  ssh) run_vagrant ssh ;;
+  destroy) run_vagrant destroy --force ;;
+  -h|--help|help|'') usage ;;
+  *) echo "unknown command: $1" >&2; usage >&2; exit 2 ;;
+esac
