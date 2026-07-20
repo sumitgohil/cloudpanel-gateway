@@ -3,6 +3,8 @@
 /dist/
 /.cache/
 /coverage.out
+/lab/.build/
+/.vagrant/
 
 # Local development state and secrets
 /dev-config.json
