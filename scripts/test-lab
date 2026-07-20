@@ -121,7 +121,7 @@ show_info() {
   run_vagrant ssh -c 'sudo cat /root/cloudpanel-gateway-test-lab/access.json'
   printf '\nAdd this host entry manually (the launcher never edits your host):\n  '
   show_hosts
-  printf '\nCloudPanel uses a local certificate; accept the browser warning at https://%s:8443.\n' "$lab_ip"
+  printf '\nCloudPanel and Gateway use local certificates; accept the browser warning at https://%s:8443 and https://%s.\n' "$lab_ip" "$LAB_DOMAIN"
 }
 
 case "${1:-}" in

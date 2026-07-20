@@ -39,11 +39,11 @@ Add this line to your host file with administrator rights:
 - macOS and Linux: `/etc/hosts`
 - Windows: `%SystemRoot%\System32\drivers\etc\hosts`
 
-Then open CloudPanel at `https://192.168.56.56:8443`. The local CloudPanel
-certificate is not publicly trusted, so the browser warning is expected. Use
-`http://gateway.cpgw.test/mcp` for the local MCP endpoint after adding the host
-entry. Let’s Encrypt is intentionally not requested because this private test
-domain has no public DNS.
+Then open CloudPanel at `https://192.168.56.56:8443`. The local CloudPanel and
+Gateway certificates are not publicly trusted, so the browser warning is
+expected. Use `https://gateway.cpgw.test/mcp` for the local MCP endpoint after
+adding the host entry. Let’s Encrypt is intentionally not requested because
+this private test domain has no public DNS.
 
 ## Lifecycle and safety
 

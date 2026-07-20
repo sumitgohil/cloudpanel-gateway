@@ -119,7 +119,7 @@ write_access_file() {
   install -d -m 0700 "$(dirname "$access_file")"
   umask 077
   cat > "$access_file" <<EOF
-{"vm_ip":"${LAB_IP}","cloudpanel_url":"https://${LAB_IP}:8443","cloudpanel_username":"lab-admin","cloudpanel_password":"${password}","gateway_domain":"${LAB_DOMAIN}","gateway_url":"http://${LAB_DOMAIN}","mcp_url":"http://${LAB_DOMAIN}/mcp","gateway_token":"${token}","hosts_entry":"${LAB_IP} ${LAB_DOMAIN}"}
+{"vm_ip":"${LAB_IP}","cloudpanel_url":"https://${LAB_IP}:8443","cloudpanel_username":"lab-admin","cloudpanel_password":"${password}","gateway_domain":"${LAB_DOMAIN}","gateway_url":"https://${LAB_DOMAIN}","mcp_url":"https://${LAB_DOMAIN}/mcp","gateway_token":"${token}","hosts_entry":"${LAB_IP} ${LAB_DOMAIN}"}
 EOF
   chmod 0600 "$access_file"
 }

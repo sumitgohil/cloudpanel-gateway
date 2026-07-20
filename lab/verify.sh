@@ -21,7 +21,7 @@ ip="$(json_value vm_ip)"
 token="$(json_value gateway_token)"
 [[ -n "$domain" && -n "$ip" && -n "$token" ]] || { echo "invalid lab access file" >&2; exit 1; }
 getent hosts "$domain" | grep -Fq "$ip"
-curl --fail --silent --resolve "${domain}:80:${ip}" "http://${domain}/healthz" | grep -q '"status"'
+curl --fail --silent --insecure --resolve "${domain}:443:${ip}" "https://${domain}/healthz" | grep -q '"status"'
 curl --fail --silent -H "Authorization: Bearer ${token}" http://127.0.0.1:9780/openapi.json >/dev/null
 
 policy_json="$(cloudpanel-gateway policy list)"
