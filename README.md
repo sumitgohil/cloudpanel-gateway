@@ -195,6 +195,28 @@ For the disposable test VM only, `install.sh --local-binary /path/to/binary`
 skips release download verification. It is deliberately unsuitable for a
 production install.
 
+
+## Why I built this
+
+CloudPanel is a capable server-management platform, but it does not provide an official API or MCP interface. That makes repeatable automation, platform integrations, and AI-assisted operations unnecessarily difficult.
+
+I built CloudPanel Gateway to close that gap: a secure automation control plane that exposes CloudPanel administration through REST APIs, MCP tools, and a local CLI. Rather than being just a wrapper around `clpctl`, it makes common operational tasks safer and easier to automate—site management, logs, deployments, backups, PHP and TLS settings, static/Node/SSR hosting, and managed cron jobs.
+
+Security was the central constraint from the beginning. The gateway is written in Go as a single deployable binary, uses scoped permissions and policy gates, keeps privileged actions isolated, audits sensitive changes, and verifies release artifacts before installation. The goal is to make powerful server automation practical without turning an API into unrestricted root access.
+
+## How Codex helped me
+
+Codex acted as my engineering partner throughout the project.
+
+It first examined the existing CloudPanel CLI, the reference implementation, and a real disposable CloudPanel VM to turn the initial idea into a concrete architecture. From there, it helped design and implement the Go gateway, REST and MCP interfaces, installer, systemd services, documentation, tests, and release workflow.
+
+A particularly valuable part was working against a live environment. Codex validated features on disposable VMs, uncovered real integration issues—such as SQLite transaction locking, service-startup timing, and Nginx runtime isolation—and then implemented focused fixes and retested them end to end.
+
+It also helped extend the product beyond basic CLI wrapping. For example, we designed and implemented secure, CloudPanel-compatible cron-job management across MCP, REST, and CLI. This included strict schedule validation, typed job runners, revision checks, policy-gated raw commands, atomic SQLite and `/etc/cron.d` updates, and live verification that the CloudPanel UI and underlying server configuration stayed in sync.
+
+Finally, Codex helped make the project releasable: setting up signed builds, checksum and Minisign verification, release automation, a secure curl-based installer, and documentation that positions the gateway as a broader secure automation platform rather than a simple CLI adapter.
+
+
 ## Contributing and support
 
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request,
